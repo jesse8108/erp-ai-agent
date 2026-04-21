@@ -1,0 +1,2258 @@
+# schema.md - 业务表结构定义
+
+> **版本**: v0.6 (全表封顶：流水 + 审计 + AI 运行表完整)
+> **状态**: 所有表定稿 ✅ 可直接交付 Codex 第 1 周建库
+> **数据分析样本**: 250 合同 + 64 工单 + 58 委托 + 37 调度 + 713 流水
+
+---
+
+## 关于此文档
+
+本文档定义 ERP 系统所有业务表的字段级规格。开发时 Codex 根据此文档创建数据库表、ORM 模型、迁移脚本。
+
+**设计原则**:
+- 字段类型用 PostgreSQL 类型
+- enum 值完整列出
+- 业务规则写具体，可翻译为代码约束
+- 跨字段约束单独列出
+- 所有聚合字段（已提货量、敞口库存、应收付等）**都是运行时计算，不存储**
+- 历史数据的脏数据模式专门标注，供导入时清洗
+- **所有业务数据一律软删除，严禁物理删除**
+- **合同的数量和单价是真源，不可被下游工单/委托修改**
+- **流水表只读不可改，对账通过视图实现（汇总级对账，不做流水-合同关联）**
+
+**v0.6 改动**:
+- 流水表（transactions）完整定稿：只读、不关联合同、3 重保护
+- 新增 4 个对账视图（规范化流水、按对方汇总流水、按对方汇总合同、最终对账视图）
+- 补充 audit_logs / change_proposals / approval_records 完整 DDL
+- 补充 history 表通用规范（5 张业务表 history）
+- 补充 AI 运行表完整 DDL（conversations / messages / pending_issues / tool_call_logs）
+- 补充配置表（user_permissions / approval_rules / audit_rule_configs / role_holders / leave_records）
+
+**v0.5 改动**:
+- 价格模型锁定（合同单价是真源）
+- 调度拆分规则（提货地/品牌/型号任一不同就拆分）
+
+**v0.4 改动**:
+- `margin_deduction_mode` 字段
+- 视图加入 receivable_amount / payable_amount
+- 提货工单/委托/调度完整定义
+
+**v0.3 改动**:
+- 全局软删除机制
+
+**v0.2 改动**:
+- 基于 250 条历史合同数据定稿，7 种合同类型
+
+---
+
+## 0. 公司主体结构（重要背景）
+
+本公司业务涉及三家关联公司，schema 设计必须理解它们各自的角色：
+
+| 公司名 | 代号 | 角色 |
+|-------|------|------|
+| 安徽趋易贸易有限公司 | subject_a | **我方主体**，直接参与销售/采购合同 |
+| 上海瞿谊实业有限公司 | subject_b | **我方主体**，直接参与销售/采购合同 |
+| 上海骋子次方商务服务有限公司 | (不入数据) | 撮合主体，只做中介，**不作为合同甲乙方出现** |
+
+**关键约束**:
+- 主体 A 和主体 B 之间**不会有内部交易**（业务已确认）
+- 撮合主体 C 不作为合同数据中的一方
+- 每份**销售类**合同的甲方必然是 subject_a 或 subject_b
+- 每份**采购类**合同的乙方必然是 subject_a 或 subject_b
+- **撮合合同**的甲方和乙方都是外部公司（我方不是交易主体）
+
+---
+
+## 0.5 软删除机制（全局规则）
+
+### 0.5.1 核心原则
+
+**任何业务表（contracts, delivery_orders, delivery_delegations, transactions 等）严禁物理删除 (DELETE FROM ...)**。所有"删除"操作都是软删除：在记录上填写 `deleted_at` 时间戳。
+
+### 0.5.2 区分两个不同层面的概念
+
+理解这一点至关重要：**"作废"和"删除"是两件不同的事**，混为一谈会造成严重的设计混乱。
+
+| 场景 | 本质 | 使用字段 | 查询时 |
+|------|------|---------|--------|
+| 合同业务上终止（客户违约、双方协商终止、货源缺失） | **业务行为** | `contract_status = 'cancelled'` | 正常显示，标注"已作废" |
+| 合同录错了/重复录入/测试数据 | **数据行为** | `deleted_at` 有时间戳 | 默认过滤，不显示 |
+
+**状态组合示意**：
+
+| 含义 | contract_status | deleted_at |
+|------|----------------|-----------|
+| 正常执行中 | `in_progress` | NULL |
+| 正常完结 | `completed` | NULL |
+| **业务作废**（保留历史） | `cancelled` | NULL |
+| **逻辑删除**（录错等） | 任何状态 | 有时间戳 |
+| 作废后又发现是误录 | `cancelled` | 有时间戳 |
+
+### 0.5.3 所有业务表的通用软删除字段
+
+所有业务表（合同、提货工单、提货委托、流水）都必须包含以下字段：
+
+| 字段名 | 类型 | 必填 | 含义 |
+|-------|------|------|------|
+| deleted_at | timestamptz | N | 软删除时间；NULL 表示未删除 |
+| deleted_by | uuid | N | 执行软删除的用户（FK → users） |
+| deleted_reason | text | N | 删除原因（软删除时必填） |
+
+**约束**: `deleted_at IS NOT NULL` 时 `deleted_by` 和 `deleted_reason` 必填；`deleted_at IS NULL` 时这三个字段都应为 NULL。
+
+### 0.5.4 主数据表的不同处理
+
+**主数据表**（users, companies, brands, products, delivery_locations）不用 `deleted_at` 机制，改用 `is_active` 字段：
+
+| 表 | 字段 | 说明 |
+|----|------|------|
+| users | `is_active`, `left_at` | 离职员工 is_active=false，历史合同依然显示姓名 |
+| companies | `is_active` | 注销的公司标记，历史合同正常引用 |
+| brands | `is_active` | 停产品牌标记 |
+| products | `is_active` | 停产型号标记 |
+| delivery_locations | `is_active` | 停用仓库标记 |
+
+**新建合同时的校验**: 不允许选择 `is_active = false` 的主数据，但**已存在的合同引用不受影响**。
+
+### 0.5.5 UNIQUE 约束的特殊处理
+
+所有原本 UNIQUE 的字段（如 `contract_number`, `feishu_open_id`）改为**部分唯一索引**，只对未删除记录生效：
+
+```sql
+-- 错误写法（会导致软删除后无法用同样的编号新建）
+CREATE UNIQUE INDEX idx_contracts_number ON contracts(contract_number);
+
+-- 正确写法（部分唯一索引）
+CREATE UNIQUE INDEX idx_contracts_number_active
+  ON contracts(contract_number) WHERE deleted_at IS NULL;
+```
+
+这样允许合同号在**软删除的错录合同**和**新合同**之间复用。
+
+### 0.5.6 外键的处理
+
+**软删除不使用 CASCADE**。合同被软删除时：
+- 关联的提货工单/委托**不自动删除**
+- 外键引用依然指向这条"已删除"的合同
+- 查询关联数据时能明确看到"指向已删除记录"的情况
+- 这是**有意设计**——便于审计和恢复
+
+**配套的审计规则**: 新增 `orphan_delivery_to_deleted_contract_check` 审计规则——提货工单指向已软删除的合同时，标记为严重异常。
+
+### 0.5.7 查询的默认过滤
+
+在 SQLAlchemy ORM 基类上配置默认过滤，所有查询自动加 `deleted_at IS NULL`：
+
+```python
+# app/db/models/base.py
+class SoftDeleteMixin:
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    deleted_by: Mapped[Optional[UUID]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    deleted_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+# 查询时默认过滤已删除
+class Contract(Base, SoftDeleteMixin):
+    ...
+
+# 默认 query (过滤已删除)
+session.query(Contract).all()  # 自动加 WHERE deleted_at IS NULL
+
+# 管理员查询（含已删除）
+session.query(Contract).execution_options(include_deleted=True).all()
+```
+
+**关键要求**: AI 调用的所有查询工具**必须使用默认过滤**，只有管理员后台才能查看已删除记录。
+
+### 0.5.8 软删除与 history 表
+
+软删除本身也是一次 UPDATE 操作，必须写入 history 表：
+
+```
+history 记录:
+  op_type: 'soft_delete'
+  before_snapshot: { ...合同完整数据, deleted_at: NULL }
+  after_snapshot: { ...合同完整数据, deleted_at: '2026-04-20 10:30:00', deleted_by: 'xxx', deleted_reason: '重复录入' }
+  changed_fields: ['deleted_at', 'deleted_by', 'deleted_reason', 'version', 'updated_at', 'updated_by']
+  audit_log_id: 关联到 AI 对话触发的 audit_log
+```
+
+即使合同被删除了，完整的"曾经长什么样"依然在 history 里。
+
+### 0.5.9 删除相关的三个 Workflow
+
+在 workflows.md 里要设计三个独立 workflow：
+
+**Workflow: `cancel_contract`（作废合同）** — 业务行为
+- 操作：`contract_status` → `cancelled`
+- 保留所有数据，正常查询能看到
+- 必须填写作废原因
+- 需审批
+- 如有关联提货记录，提示业务员是否需要同步处理（不强制）
+
+**Workflow: `soft_delete_contract`（逻辑删除合同）** — 数据行为
+- 操作：`deleted_at` 填时间戳
+- 适用场景：录错了/重复了/测试数据
+- 必须填写删除原因
+- 需更严格审批（比作废更严格）
+- **前置检查**：如果有关联的非删除状态的提货记录，先提示业务员是否一并软删除，或要求先处理关联数据
+
+**Workflow: `restore_deleted_contract`（恢复误删）** — 管理员能力
+- 操作：`deleted_at` 置回 NULL
+- 只有老板或管理员能执行
+- 必须填写恢复原因
+- 自动检查：如果当前存在与被恢复合同的 `contract_number` 相同的活跃合同，拒绝恢复
+
+### 0.5.10 AI 对话中的意图区分
+
+AI 的 system prompt 必须明确区分"作废"和"删除"：
+
+```
+用户说"删除合同" → 默认理解为"作废"（业务行为），调 cancel_contract
+用户说"这个录错了删掉" / "这是重复的" → 调 soft_delete_contract
+用户说"恢复刚才误删的 XX" → 调 restore_deleted_contract（只有管理员）
+
+如果用户表述模糊，必须反问:
+"你是想要：
+A) 作废这份合同（业务上不执行了，但保留记录以便对账）
+B) 删除这条录入（因为录错了或重复了）"
+```
+
+这条规则要写进 business-defaults.md。
+
+### 0.5.11 审计与对账的特殊考虑
+
+软删除引入了新的审计维度：
+
+- **误删监测**：短时间内（如 24 小时）软删除又恢复的情况要标记，防止滥用
+- **孤儿检测**：提货工单指向已软删除合同 → 严重异常
+- **级联检测**：软删除合同后，如果关联提货未处理，生成待办
+
+这些规则在 audit-rules.md 里专门列出。
+
+---
+
+## 1. contracts（合同表）
+
+### 1.1 用途
+
+记录销售、采购、撮合、借货四大类业务合同，是 ERP 核心主表。
+
+**记录量级**: 每月约 60-100 条，当前累计约 250 条
+
+### 1.2 合同类型（核心分类）
+
+系统区分 **4 大类 7 小类**合同：
+
+| 大类 | 小类（enum 值） | 含义 | 我方角色 | 我方主体参与 |
+|------|---------------|------|---------|-------------|
+| 销售 | `sales` | 我方直销，主体 A 或 B 作为甲方卖给外部客户 | 卖方 | ✅ 甲方 |
+| 采购 | `purchase` | 我方直采，主体 A 或 B 作为乙方从外部供应商买入 | 买方 | ✅ 乙方 |
+| 撮合 | `brokering` | 纯撮合，甲乙方都是外部公司，我方赚佣金 | 中介 | ❌ |
+| 撮合 | `brokering_sales` | 撮合下的销售侧，主体 A 或 B 为甲方，有撮合业务员参与 | 卖方 | ✅ 甲方 |
+| 撮合 | `brokering_purchase` | 撮合下的采购侧，主体 A 或 B 为乙方，有撮合业务员参与 | 买方 | ✅ 乙方 |
+| 借货 | `lending_sales` | 借货给外部方（主体 A/B 为甲方借出），对方付保证金，还货后退保证金 | 借出方 | ✅ 甲方 |
+| 借货 | `lending_purchase` | 从外部方借货（主体 A/B 为乙方借入），付保证金，还货后退保证金 | 借入方 | ✅ 乙方 |
+
+**销售 vs 撮合销售的区别**:
+- 销售: 纯我方业务员跟进，无撮合佣金拆分
+- 撮合销售: 撮合业务员介绍来的生意，要按佣金规则分成
+
+**借货合同的业务逻辑**:
+- 数据结构上和销售/采购完全一样（走同样的字段和 workflow）
+- 差别在业务语义：`total_amount` 是账面价值非实际付款，`margin_amount` 是抵押金非预付款
+- 合同完结的语义是"对方归还了货物并退还了保证金"
+
+### 1.3 字段定义
+
+#### 1.3.1 标识字段
+
+| 字段名 | 类型 | 必填 | 含义 | 约束 |
+|--------|------|------|------|------|
+| id | uuid | Y | 主键 | PK, default gen_random_uuid() |
+| contract_number | varchar(50) | Y | 合同编号 | UNIQUE |
+
+**合同编号格式**: 样本中 76 种前缀格式（`CZCH-`, `HY-`, `QYXS-` 等），**系统只保证 UNIQUE，不做格式校验**。
+
+#### 1.3.2 分类与状态字段
+
+| 字段名 | 类型 | 必填 | 含义 | 约束 |
+|--------|------|------|------|------|
+| contract_type | enum | Y | 合同类型 | 见 1.2 |
+| contract_status | enum | Y | 合同状态 | `not_started` / `in_progress` / `completed` / `cancelled` |
+
+**contract_status 枚举**:
+- `not_started`（未执行）: 40 条样本
+- `in_progress`（执行中）: 10 条样本
+- `completed`（已完结）: 200 条样本
+- `cancelled`（已作废）: 新系统新增，历史数据中无此状态
+
+**状态流转规则**:
+```
+not_started → in_progress：首次有提货发生时自动流转
+in_progress → completed：提货总量达到 quantity_tons 时自动流转
+                        （借货合同为"对方还货完成"）
+not_started / in_progress → cancelled：需审批，不可逆转
+completed → cancelled：不允许直接转换，必须走 split_contract 等特殊 workflow
+```
+
+#### 1.3.3 主体与交易对手字段（核心重构）
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| our_subject_company | enum | 条件必填 | 我方主体，`subject_a` / `subject_b` / NULL |
+| our_role | enum | Y | 我方角色，`seller` / `buyer` / `broker_only` / `lender` / `borrower` |
+| party_a_name | varchar(200) | Y | 甲方名称（法律合同中的称呼） |
+| party_a_company_id | uuid | N | 甲方外部公司 ID（软关联，FK → companies） |
+| party_b_name | varchar(200) | Y | 乙方名称 |
+| party_b_company_id | uuid | N | 乙方外部公司 ID（软关联） |
+
+**our_subject_company 条件必填规则**:
+```
+IF contract_type = 'brokering':
+    our_subject_company 必须为 NULL（撮合合同我方不是主体）
+
+IF contract_type != 'brokering':
+    our_subject_company 必填（subject_a 或 subject_b 二选一）
+```
+
+**our_role 自动推导规则**（不用业务员填，从 contract_type 推导）:
+```
+sales, brokering_sales → seller
+purchase, brokering_purchase → buyer
+brokering → broker_only
+lending_sales → lender
+lending_purchase → borrower
+```
+
+**甲乙方与 our_subject_company 的一致性约束**:
+```
+IF contract_type IN ('sales', 'brokering_sales', 'lending_sales'):
+    party_a_name 必须等于 our_subject_company 对应的公司全名
+
+IF contract_type IN ('purchase', 'brokering_purchase', 'lending_purchase'):
+    party_b_name 必须等于 our_subject_company 对应的公司全名
+
+IF contract_type = 'brokering':
+    party_a_name 和 party_b_name 都**不得**等于任何我方主体公司全名
+```
+
+**party_*_company_id 的软关联策略**:
+- Phase 1: 合同保留甲方/乙方的**文本名称**为主，company_id 可空
+- 不强制要求所有合同的对方公司都在 companies 表中注册
+- 好处：导入历史数据时不会因为"对方公司名对不上主数据"而失败
+- Phase 2: 逐步规范化，最终目标是所有合同都有 company_id
+
+#### 1.3.4 业务员归属字段
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| salesperson_user_id | uuid | 条件必填 | 主责业务员（FK → users） |
+| broker_party_a_user_id | uuid | 条件必填 | 撮合甲方业务员（FK → users） |
+| broker_party_b_user_id | uuid | 条件必填 | 撮合乙方业务员（FK → users） |
+
+**条件必填规则**:
+```
+IF contract_type IN ('sales', 'purchase'):
+    salesperson_user_id 必填
+    broker_party_a_user_id 和 broker_party_b_user_id 必须为 NULL
+
+IF contract_type IN ('brokering', 'brokering_sales', 'brokering_purchase'):
+    broker_party_a_user_id 必填
+    broker_party_b_user_id 必填
+    salesperson_user_id 可为 NULL（允许一笔撮合业务同时有主业务员跟进）
+
+IF contract_type IN ('lending_sales', 'lending_purchase'):
+    salesperson_user_id 必填（借货也是销售/采购业务）
+    broker 字段可为 NULL（除非借货是通过撮合达成）
+```
+
+**历史数据**: 66 条记录（撮合类 + 部分借货类）的 salesperson_user_id 为空。导入时：
+- 撮合类为空合法
+- 借货类为空需标记待补充（上线后逐步完善）
+
+#### 1.3.5 商品字段
+
+| 字段名 | 类型 | 必填 | 含义 | 约束 |
+|--------|------|------|------|------|
+| brand_id | uuid | Y | 品牌 | FK → brands |
+| product_model | varchar(100) | N | 型号 | 4 条历史数据为空（水料），允许空 |
+| quantity_tons | decimal(12,3) | Y | 数量（吨） | > 0 |
+| unit_price | decimal(10,2) | N | 单价（元/吨） | > 0 when not null |
+| delivery_location_id | uuid | Y | 提货地 | FK → delivery_locations |
+
+**unit_price 可空说明**: 少数借货或特殊合同可无单价。
+
+#### 1.3.6 时间字段
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| signed_date | date | Y | 签订日期 |
+| valid_from | date | Y | 合同开始时间 |
+| valid_to | date | Y | 合同结束时间 |
+
+**业务规则**:
+- `valid_to > valid_from` （强约束）
+- `signed_date ≤ valid_from` （软规则，不强制——偶有补签情况）
+
+#### 1.3.7 保证金字段
+
+| 字段名 | 类型 | 必填 | 含义 | 约束 |
+|--------|------|------|------|------|
+| margin_type | enum | N | 保证金方式 | `full` / `fixed_ratio` / `fixed_amount` |
+| fixed_ratio | decimal(5,4) | 条件必填 | 固定比例（0 < x ≤ 1） | |
+| fixed_amount | decimal(12,2) | 条件必填 | 固定金额（元） | > 0 |
+| margin_deduction_mode | enum | 条件必填 | 保证金扣除模式 | `proportional` / `at_end` |
+
+**margin_type 枚举**:
+- `full`（全款）: 108 条，保证金 = 合同总金额
+- `fixed_ratio`（固定比例）: 131 条，保证金 = 总金额 × 固定比例
+- `fixed_amount`（固定金额）: 7 条，保证金 = fixed_amount
+
+**margin_deduction_mode 枚举**（仅 fixed_ratio / fixed_amount 场景适用）:
+- `proportional`（按比例扣除）: 每次提货的应收/付 = 已提量 × 单价 × (1 - 保证金率) + 保证金金额。即每车只收"货款的 1-保证金率"部分，保证金挂账一直存在
+- `at_end`（最后扣除）: 前期每车按全价付货款，剩余可提量 ≤ 保证金对应吨数时，应收/付锁定为合同总金额
+
+**注意**: 原历史数据中的 `margin_amount` 字段**不存储**，改为运行时计算（见 1.4）。
+
+**条件必填规则**:
+```
+IF margin_type = 'full':
+    fixed_ratio 必须为 NULL
+    fixed_amount 必须为 NULL
+    margin_deduction_mode 必须为 NULL（全款不需要扣除模式）
+
+IF margin_type = 'fixed_ratio':
+    fixed_ratio 必填
+    fixed_amount 必须为 NULL
+    margin_deduction_mode 必填（proportional 或 at_end）
+
+IF margin_type = 'fixed_amount':
+    fixed_amount 必填
+    fixed_ratio 必须为 NULL
+    margin_deduction_mode 必填（proportional 或 at_end）
+
+IF margin_type IS NULL:
+    fixed_ratio, fixed_amount, margin_deduction_mode 都必须为 NULL
+```
+
+**历史数据脏数据**: 34 条 margin_type=full 的记录同时填了 fixed_ratio（冗余）。导入时清洗，把这些 fixed_ratio 置空。历史数据需补充 `margin_deduction_mode`（可通过业务员批量核实，或给所有 fixed_ratio 的历史记录暂时填 `proportional` 作为默认值后人工复核）。
+
+**借货合同的保证金语义**:
+- `margin_type` 仍按上述三种取值
+- 但业务上叫"抵押金"而不是"预付款"
+- 合同完结时保证金需退回（由流水记录反映）
+- 借货合同的应收/付计算逻辑特殊（见 1.4）
+
+#### 1.3.8 交付方式字段
+
+| 字段名 | 类型 | 必填 | 含义 | 约束 |
+|--------|------|------|------|------|
+| delivery_method | enum | N | 交付方式 | `self_pickup` / `shipped` |
+| freight_per_ton_incl_tax | decimal(8,2) | N | 含税运费（元/吨） | ≥ 0 |
+| find_truck_freight_excl_tax | decimal(10,2) | N | 帮找车运费（元/车，不含税） | ≥ 0 |
+
+**delivery_method 枚举**:
+- `self_pickup`（自提）: 208 条，买方自提
+- `shipped`（送到）: 38 条，我方负责送到
+
+**软约束**（不强制）:
+- `self_pickup` 下 `freight_per_ton_incl_tax` 通常为空，`find_truck_freight_excl_tax` 偶尔有值（帮买方安排运输）
+- `shipped` 下 `freight_per_ton_incl_tax` 通常有值
+
+#### 1.3.9 合同总金额
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| total_amount | decimal(14,2) | Y | 合同总金额 |
+
+**计算规则**:
+```
+IF unit_price IS NOT NULL:
+    total_amount = quantity_tons × unit_price
+    （应用约束: 允许 0.01 元以内的四舍五入误差）
+IF unit_price IS NULL:
+    total_amount 允许人工录入
+```
+
+历史数据 100% 符合此规则 ✅
+
+**不再存储的字段**（都改为运行时计算）:
+- `receivable_payable_amount`（历史字段，新系统提货事件级计算）
+- `margin_amount`
+- `delivered_tons_sales` / `delivered_tons_purchase`（从 delivery_orders / delegations 聚合）
+- `open_stock_sales` / `open_stock_purchase`
+- `total_commission_party_a` / `total_commission_party_b`
+
+#### 1.3.10 撮合佣金字段（仅撮合类合同）
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| commission_per_ton_party_a | decimal(8,2) | 条件必填 | 甲方佣金单价（元/吨） |
+| commission_per_ton_party_b | decimal(8,2) | 条件必填 | 乙方佣金单价（元/吨） |
+
+**条件必填规则**:
+```
+IF contract_type LIKE 'brokering%':
+    commission_per_ton_party_a 必填（可为 0）
+    commission_per_ton_party_b 必填（可为 0）
+ELSE:
+    两字段必须为 NULL
+```
+
+**总佣金**: 运行时计算（见 1.4），非存储字段。
+
+#### 1.3.11 其他字段
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| notes | text | N | 备注 |
+| attachments | jsonb | N | 附件列表（Phase 2 实现） |
+
+#### 1.3.12 通用审计字段（所有表共有）
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| created_by | uuid | Y | 创建人（FK → users） |
+| created_at | timestamptz | Y | 创建时间 |
+| updated_by | uuid | Y | 最后更新人（FK → users） |
+| updated_at | timestamptz | Y | 最后更新时间 |
+| version | int | Y | 乐观锁版本号，默认 1 |
+
+#### 1.3.13 软删除字段（所有业务表共有）
+
+见 0.5 章完整说明。字段定义：
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| deleted_at | timestamptz | N | 软删除时间；NULL 表示未删除 |
+| deleted_by | uuid | N | 执行软删除的用户（FK → users） |
+| deleted_reason | text | N | 删除原因 |
+
+**约束**:
+- `deleted_at IS NOT NULL` 时 `deleted_by` 和 `deleted_reason` 必填
+- `deleted_at IS NULL` 时这三个字段都应为 NULL
+
+**这三个字段的组合约束**通过数据库 CHECK 约束强制（见 1.5 完整 DDL）。
+
+### 1.4 运行时计算字段（通过 VIEW 暴露）
+
+以下字段**不在 contracts 表中存储**，通过 SQL VIEW 或应用层实时计算，彻底避免数据不一致问题。
+
+#### 视图: `v_contracts_with_aggregates`
+
+**注意**：此视图默认**只包含未软删除的合同**（`deleted_at IS NULL`）。另建一个 `v_contracts_with_aggregates_including_deleted` 视图供管理员查看。
+
+```sql
+CREATE VIEW v_contracts_with_aggregates AS
+WITH base AS (
+  SELECT
+    c.*,
+    -- 保证金金额
+    CASE c.margin_type
+      WHEN 'full' THEN c.total_amount
+      WHEN 'fixed_ratio' THEN c.total_amount * c.fixed_ratio
+      WHEN 'fixed_amount' THEN c.fixed_amount
+      ELSE NULL
+    END AS margin_amount,
+    
+    -- 已提货量（销售侧）
+    COALESCE((
+      SELECT SUM(do.quantity_tons) FROM delivery_orders do
+      WHERE do.sales_contract_id = c.id 
+        AND do.status != 'cancelled'
+        AND do.deleted_at IS NULL
+    ), 0) AS delivered_tons_sales,
+    
+    -- 已提货量（采购侧）
+    COALESCE((
+      SELECT SUM(dd.quantity_tons) FROM delivery_delegations dd
+      WHERE dd.purchase_contract_id = c.id 
+        AND dd.status != 'cancelled'
+        AND dd.deleted_at IS NULL
+    ), 0) AS delivered_tons_purchase,
+    
+    -- 销售侧额外费用汇总（所有关联工单的 extra_fee 之和）
+    COALESCE((
+      SELECT SUM(do.extra_fee) FROM delivery_orders do
+      WHERE do.sales_contract_id = c.id 
+        AND do.status != 'cancelled'
+        AND do.deleted_at IS NULL
+    ), 0) AS total_extra_fee_sales,
+    
+    -- 采购侧额外费用汇总
+    COALESCE((
+      SELECT SUM(dd.extra_payment) FROM delivery_delegations dd
+      WHERE dd.purchase_contract_id = c.id 
+        AND dd.status != 'cancelled'
+        AND dd.deleted_at IS NULL
+    ), 0) AS total_extra_payment_purchase
+  FROM contracts c
+  WHERE c.deleted_at IS NULL
+)
+SELECT
+  base.*,
+  
+  -- 敞口库存
+  base.quantity_tons - base.delivered_tons_sales AS open_stock_sales,
+  base.quantity_tons - base.delivered_tons_purchase AS open_stock_purchase,
+  
+  -- 销售应收款（仅对 our_role=seller/broker_only 的合同有意义）
+  CASE 
+    -- 撮合纯中介：不计算应收应付
+    WHEN base.contract_type = 'brokering' THEN NULL
+    -- 借货合同：只有保证金
+    WHEN base.contract_type LIKE 'lending_%' THEN 
+      COALESCE(base.margin_amount, 0) + base.total_extra_fee_sales
+    -- 非销售侧合同：此字段无意义
+    WHEN base.our_role NOT IN ('seller', 'lender') THEN NULL
+    -- 全款
+    WHEN base.margin_type = 'full' THEN 
+      base.total_amount + base.total_extra_fee_sales
+    -- 按比例扣除
+    WHEN base.margin_deduction_mode = 'proportional' THEN 
+      base.delivered_tons_sales * base.unit_price 
+      * (1 - base.margin_amount / NULLIF(base.total_amount, 0))
+      + base.margin_amount 
+      + base.total_extra_fee_sales
+    -- 最后扣除
+    WHEN base.margin_deduction_mode = 'at_end' THEN
+      CASE 
+        WHEN (base.quantity_tons - base.margin_amount / NULLIF(base.unit_price, 0)) 
+             > base.delivered_tons_sales THEN
+          base.delivered_tons_sales * base.unit_price + base.margin_amount + base.total_extra_fee_sales
+        ELSE
+          base.total_amount + base.total_extra_fee_sales
+      END
+    ELSE NULL
+  END AS receivable_amount,
+  
+  -- 采购应付款（仅对 our_role=buyer/borrower 的合同有意义）
+  CASE 
+    WHEN base.contract_type = 'brokering' THEN NULL
+    WHEN base.contract_type LIKE 'lending_%' THEN 
+      COALESCE(base.margin_amount, 0) + base.total_extra_payment_purchase
+    WHEN base.our_role NOT IN ('buyer', 'borrower') THEN NULL
+    WHEN base.margin_type = 'full' THEN 
+      base.total_amount + base.total_extra_payment_purchase
+    WHEN base.margin_deduction_mode = 'proportional' THEN 
+      base.delivered_tons_purchase * base.unit_price 
+      * (1 - base.margin_amount / NULLIF(base.total_amount, 0))
+      + base.margin_amount 
+      + base.total_extra_payment_purchase
+    WHEN base.margin_deduction_mode = 'at_end' THEN
+      CASE 
+        WHEN (base.quantity_tons - base.margin_amount / NULLIF(base.unit_price, 0)) 
+             > base.delivered_tons_purchase THEN
+          base.delivered_tons_purchase * base.unit_price + base.margin_amount + base.total_extra_payment_purchase
+        ELSE
+          base.total_amount + base.total_extra_payment_purchase
+      END
+    ELSE NULL
+  END AS payable_amount,
+  
+  -- 总撮合佣金（仅撮合类合同，基于实际提货量）
+  CASE WHEN base.contract_type LIKE 'brokering%' THEN
+    COALESCE(base.commission_per_ton_party_a, 0) * base.delivered_tons_sales
+  ELSE NULL END AS total_commission_party_a,
+  
+  CASE WHEN base.contract_type LIKE 'brokering%' THEN
+    COALESCE(base.commission_per_ton_party_b, 0) * base.delivered_tons_purchase
+  ELSE NULL END AS total_commission_party_b
+
+FROM base;
+```
+
+**公式业务说明**（给 Codex 验证用）：
+
+用合同：100 吨 × 8000 元/吨 × 保证金 10% = 合同总金额 80 万、保证金 8 万
+- 全款：应收恒为 80 万 + 额外费用
+- 按比例扣除 + 已提 33 吨：`33 × 8000 × 0.9 + 80000 = 317,600` + 额外费用
+- 最后扣除 + 已提 33 吨：`33 × 8000 + 80000 = 344,000` + 额外费用（此时剩余 67 吨 > 10 吨保证金对应量，按全额）
+- 最后扣除 + 已提 92 吨：`= 800,000` + 额外费用（此时剩余 8 吨 ≤ 10 吨，锁定合同总金额）
+- 借货 + 保证金 8 万：应收 = 80,000 + 额外费用
+
+### 1.5 索引建议
+
+```sql
+CREATE INDEX idx_contracts_type ON contracts(contract_type);
+CREATE INDEX idx_contracts_status ON contracts(contract_status);
+CREATE INDEX idx_contracts_subject ON contracts(our_subject_company);
+CREATE INDEX idx_contracts_salesperson ON contracts(salesperson_user_id);
+CREATE INDEX idx_contracts_broker_a ON contracts(broker_party_a_user_id);
+CREATE INDEX idx_contracts_broker_b ON contracts(broker_party_b_user_id);
+CREATE INDEX idx_contracts_signed_date ON contracts(signed_date DESC);
+CREATE INDEX idx_contracts_valid_range ON contracts(valid_from, valid_to);
+CREATE INDEX idx_contracts_brand ON contracts(brand_id);
+-- 模糊搜索
+CREATE INDEX idx_contracts_party_a_trgm ON contracts USING gin(party_a_name gin_trgm_ops);
+CREATE INDEX idx_contracts_party_b_trgm ON contracts USING gin(party_b_name gin_trgm_ops);
+-- 组合索引（最常用的查询：查某业务员负责的活跃合同）
+CREATE INDEX idx_contracts_salesperson_status ON contracts(salesperson_user_id, contract_status);
+-- 软删除相关索引
+CREATE INDEX idx_contracts_deleted_at ON contracts(deleted_at) WHERE deleted_at IS NOT NULL;
+-- 部分唯一索引（只对未删除记录强制唯一）
+CREATE UNIQUE INDEX idx_contracts_number_active 
+  ON contracts(contract_number) WHERE deleted_at IS NULL;
+```
+
+**关键说明**：`contract_number` 的 UNIQUE 约束不在表定义里（`UNIQUE NOT NULL`），改为部分唯一索引。这样：
+- 未删除合同之间 `contract_number` 必须唯一 ✅
+- 软删除的合同不占用 `contract_number` 空间
+- 新合同可以复用已软删除的合同号
+
+### 1.6 历史数据导入清洗规则
+
+导入 2026-04-20 导出的 250 条历史数据时需要的清洗动作：
+
+| 清洗项 | 原数据 | 清洗后 |
+|--------|-------|-------|
+| 合同类型中文转 enum | "撮合采购" | `brokering_purchase` |
+| 合同状态中文转 enum | "已完结" | `completed` |
+| 保证金方式中文转 enum | "固定比例" | `fixed_ratio` |
+| 交付方式中文转 enum | "自提" | `self_pickup` |
+| 业务员姓名转 user_id | "李成子" | 对应 users.id |
+| 识别 our_subject_company | 检查甲方/乙方名称是否包含"安徽趋易"或"上海瞿谊" | 填入 subject_a 或 subject_b |
+| our_role 推导 | 根据 contract_type 自动计算 | seller/buyer/broker_only/lender/borrower |
+| fixed_ratio 清洗 | margin_type=full 同时填了 fixed_ratio 的 34 条 | 把 fixed_ratio 置空 |
+| 丢弃字段 | receivable_payable_amount, margin_amount, 已提货量, 敞口库存, 总佣金 | 不存入合同表（视图计算） |
+| 附件字段 | 全为空 | 导入为 NULL |
+
+### 1.7 关键约束检查清单（Codex 实现时必做）
+
+在 workflow 的 validate 阶段实现以下跨字段约束（数据库 CHECK 约束 + 应用层二次校验）：
+
+- [ ] `our_subject_company` 的条件必填（brokering 必空，其他必填）
+- [ ] `salesperson` vs `broker` 字段的互斥关系（根据合同类型）
+- [ ] `party_a_name` / `party_b_name` 与 `our_subject_company` 的一致性
+- [ ] `margin_type` 和 `fixed_ratio`/`fixed_amount`/`margin_deduction_mode` 的四路互斥
+- [ ] `margin_deduction_mode` 条件必填：full 时必空、fixed_* 时必填
+- [ ] `commission_per_ton_*` 的条件必填（撮合类必填、其他必空）
+- [ ] `total_amount = quantity_tons × unit_price`（允许 0.01 误差）
+- [ ] `valid_to > valid_from`
+- [ ] `quantity_tons > 0`
+- [ ] `contract_status` 流转合法性
+- [ ] **软删除三字段一致性**：`deleted_at IS NOT NULL` ⇔ `deleted_by IS NOT NULL` ⇔ `deleted_reason IS NOT NULL`
+- [ ] **软删除后禁止再更新**：已软删除的记录除了"恢复操作"外不可修改
+- [ ] **恢复前检查号码冲突**：恢复软删除的合同前校验 `contract_number` 是否与现有活跃合同冲突
+
+---
+
+## 2. users（内部员工表）
+
+### 2.1 用途
+记录公司内部员工，关联飞书身份，权限控制基础。
+
+### 2.2 软删除策略
+
+**注意**: users 表**不使用** `deleted_at` 机制，改用 `is_active` + `left_at`。离职员工不会从系统中消失，历史合同和操作记录依然引用他们的姓名。
+
+### 2.3 字段定义
+
+| 字段名 | 类型 | 必填 | 含义 | 说明 |
+|--------|------|------|------|------|
+| id | uuid | Y | 主键 | |
+| feishu_open_id | varchar(100) | Y | 飞书 open_id | 见下说明 |
+| name | varchar(50) | Y | 姓名 | |
+| roles | text[] | Y | 角色列表（支持一人多角色） | 见下 |
+| is_active | boolean | Y | 是否在职 | 默认 true |
+| joined_at | date | N | 入职日期 | |
+| left_at | date | N | 离职日期 | |
+
+**feishu_open_id 的唯一约束**: 使用部分唯一索引，只对 `is_active = true` 的记录强制唯一
+
+```sql
+CREATE UNIQUE INDEX idx_users_feishu_active
+  ON users(feishu_open_id) WHERE is_active = true;
+```
+
+**roles 枚举值**（一人可以有多个）:
+- `sales` - 销售业务员
+- `purchase` - 采购业务员
+- `broker` - 撮合业务员
+- `clerk` - 单证（做提货工单/委托）
+- `finance` - 财务
+- `admin` - 系统管理员
+- `boss` - 老板（全局可见）
+
+### 2.4 初始数据（基于合同数据聚合）
+
+| 姓名 | 出现合同数 | 推测主角色 |
+|-----|----------|----------|
+| 李成子 | 82 | ['sales', 'broker'] |
+| 祝晓彤 | 43 | ['sales'] |
+| 黄佳欣 | 33 | ['broker', 'sales']（撮合较多）|
+| 游鑫淼 | 17 | ['sales'] |
+| 陈凯丽 | 9 | ['sales'] |
+| 邢光 | 创建了全部 250 条 | ['admin', 'clerk']（系统管理员，代录入）|
+
+**待你确认**: 每个人的具体 role（可多选）、飞书 open_id。
+
+---
+
+## 3. companies（交易对手公司表）
+
+### 3.1 用途
+记录外部交易对手公司（客户 + 供应商），支持模糊匹配。
+
+**不包括我方主体公司**（subject_a / subject_b 硬编码在 enum，骋子次方不入数据）。
+
+### 3.2 字段定义
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| id | uuid | Y | 主键 |
+| formal_name | varchar(200) | Y | 正式名（UNIQUE） |
+| company_type | enum | N | `customer` / `supplier` / `both` |
+| tax_id | varchar(30) | N | 税号 |
+| is_active | boolean | Y | 是否激活 |
+| notes | text | N | 备注 |
+
+### 3.3 说明
+
+- **软关联**: contracts 表不强制要求每个甲方/乙方都在此表注册
+- 此表作为逐步规范化的目标，Phase 2 逐步推进
+
+---
+
+## 4. company_aliases（公司简称表）
+
+支持"美远 → 美远贸易有限公司"这类映射。
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| id | uuid | Y | 主键 |
+| company_id | uuid | Y | 正式公司 ID（FK → companies）|
+| alias | varchar(100) | Y | 简称 |
+| alias_type | enum | Y | `common` / `user_specific` |
+| specific_user_id | uuid | N | 特定用户（user_specific 类型必填）|
+| confidence | decimal(3,2) | Y | 置信度，默认 1.0 |
+| source | enum | Y | `manual` / `disambiguation` / `promoted` |
+| created_at | timestamptz | Y | |
+
+---
+
+## 5. brands（品牌表）
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| id | uuid | Y | 主键 |
+| formal_name | varchar(100) | Y | 正式品牌名（UNIQUE）|
+| is_active | boolean | Y | 默认 true |
+
+### 5.1 初始数据
+
+| 品牌名 | 合同数 |
+|-------|-------|
+| 三房巷 | 93 |
+| 万凯 | 46 |
+| 大连逸盛 | 21 |
+| 海南逸盛 | 20 |
+| 华润 | 18 |
+| 华润圆粒子 | 12 |
+| 百宏 | 10 |
+| 昊源 | 9 |
+| 仪征 | 9 |
+| 富海 | 8 |
+| 恒力大有光 | 2 |
+| 膜级再生 | 2 |
+
+---
+
+## 6. products（型号表）
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| id | uuid | Y | 主键 |
+| brand_id | uuid | Y | 所属品牌（FK → brands）|
+| model | varchar(100) | Y | 型号 |
+| is_active | boolean | Y | 默认 true |
+
+**唯一约束**: (brand_id, model)
+
+---
+
+## 7. delivery_locations（提货地表）
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| id | uuid | Y | 主键 |
+| name | varchar(50) | Y | 名称（UNIQUE）|
+| full_address | text | N | 完整地址 |
+| is_active | boolean | Y | 默认 true |
+
+### 7.1 初始数据
+
+| 名称 | 合同数 |
+|-----|-------|
+| 江阴 | 115 |
+| 海宁 | 46 |
+| 基价仓库 | 41 |
+| 常州 | 18 |
+| 阜阳 | 9 |
+| 仪征 | 9 |
+| 东营 | 8 |
+| 吴江 | 2 |
+| 上海 | 2 |
+
+---
+
+## 8. brand_aliases / product_aliases（略）
+
+结构同 company_aliases，关联到 brands / products 表。
+
+---
+
+## 9. delivery_orders（提货工单表）
+
+### 9.1 用途
+
+记录每次客户发起的提货事件，对应销售类合同（`sales`, `brokering_sales`, `lending_sales`）。
+
+### 9.2 业务流程定位
+
+```
+销售合同 ──(1:N)──→ 提货工单 ──(1:N)──→ 车辆调度 ──(N:1)──→ 提货委托 ──(N:1)──→ 采购合同
+                                        每车一条                 一个工单可能拆 1~N 个委托
+```
+
+一个销售合同可被多次提货，每次建立一条工单。工单是整个提货链的起点（所有提货都由销售合同发起）。
+
+### 9.3 样本数据特征
+
+- 64 条工单记录
+- 1 张工单对应 1~5 条车辆调度（平均 1.23）
+- 1 张工单对应 1~5 条提货委托（平均 1.18，分别指向不同采购合同）
+- 工单数量 100% 等于对应所有委托数量之和 ✅
+
+### 9.4 字段定义
+
+| 字段名 | 类型 | 必填 | 含义 | 说明 |
+|--------|------|------|------|------|
+| id | uuid | Y | 主键 | |
+| order_number | varchar(50) | Y | 工单编号 | 部分唯一索引 |
+| status | enum | Y | 工单状态 | `normal` / `cancelled`，默认 normal |
+| sales_contract_id | uuid | Y | 销售合同 ID | FK → contracts |
+| quantity_tons | decimal(12,3) | Y | 提货数量（吨） | > 0；工单累计 ≤ 合同数量 |
+| unit_price | decimal(10,2) | Y | 单价（元/吨） | **必须等于销售合同的 unit_price**（见下说明）|
+| extra_fee | decimal(12,2) | N | 额外费用（元） | 特殊型号加价、仓库差价、其他一次性费用等 |
+| extra_fee_notes | text | N | 额外费用说明 | 文字描述（如"328 型号 11 吨 ×100 = 1,100"）|
+| customer_name_snapshot | varchar(200) | Y | 对应客户名称（快照） | 冗余自合同，打印凭证用 |
+| our_subject_snapshot | varchar(200) | Y | 对应主体公司（快照） | 冗余自合同 |
+| customer_delivery_letter_url | text | N | 客户提货委托书附件 URL | |
+| receipt_confirmation_url | text | N | 收货确认函附件 URL | |
+| notes | text | N | 备注 | |
+| created_by, created_at, updated_by, updated_at, version | | Y | 通用审计字段 | |
+| deleted_at, deleted_by, deleted_reason | | N | 软删除字段 | 见 0.5 |
+
+**unit_price 的强约束**（非常重要）:
+
+合同的数量和单价是整个价格体系的真源，**不可被下游工单绕过**：
+
+- 创建工单时，unit_price 从销售合同自动拷贝，**业务员不能手工输入和修改**
+- 合同单价修改了 → 对应所有未完结工单的单价同步更新（需要走修改合同 workflow）
+- 审计规则 `order_price_mismatch_check` 监测 "工单单价 ≠ 合同单价"（严重错误）
+- 如果实际结算价格需要偏离合同，**必须先修改合同**，不能在工单上直接改
+- `extra_fee` 不是"调整货款单价"的手段，而是记录一次性的额外费用（特殊型号加价、仓库差价、运费调整等），业务含义上独立于单价
+
+**与销售合同的数量守恒**（审计规则会检查）:
+```
+对某销售合同 C:
+  SUM(delivery_orders.quantity_tons WHERE sales_contract_id = C AND status='normal' AND deleted_at IS NULL) 
+  ≤ C.quantity_tons
+```
+
+**注意旧数据的"车辆调度"字段不迁移**：原飞书表中 delivery_orders.车辆调度 是逗号分隔字符串（如 `DD-20260405-018,DD-20260405-017,DD-20260405-019`）。新系统**反向关联**——车辆调度表指向工单（有 `delivery_order_id` 字段），工单表里不再存这个信息。
+
+### 9.5 索引
+
+```sql
+CREATE INDEX idx_orders_status ON delivery_orders(status);
+CREATE INDEX idx_orders_contract ON delivery_orders(sales_contract_id);
+CREATE INDEX idx_orders_created_at ON delivery_orders(created_at DESC);
+CREATE INDEX idx_orders_deleted_at ON delivery_orders(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE UNIQUE INDEX idx_orders_number_active 
+  ON delivery_orders(order_number) WHERE deleted_at IS NULL;
+```
+
+---
+
+## 10. delivery_delegations（提货委托表）
+
+### 10.1 用途
+
+记录每次向上游发起的提货委托，对应采购类合同（`purchase`, `brokering_purchase`, `lending_purchase`）。
+
+### 10.2 业务流程定位
+
+委托由工单驱动生成。一张工单可能对应多个委托（因为同一次提货可能来自不同采购合同）。
+
+### 10.3 样本数据特征
+
+- 58 条委托记录
+- 1 张工单对应 1~5 条委托
+- 委托数量 × 对应工单数量对账 100% ✅
+
+### 10.4 字段定义
+
+| 字段名 | 类型 | 必填 | 含义 | 说明 |
+|--------|------|------|------|------|
+| id | uuid | Y | 主键 | |
+| delegation_number | varchar(50) | Y | 委托编号 | 部分唯一索引 |
+| status | enum | Y | 委托状态 | `normal` / `cancelled`，默认 normal |
+| source_order_id | uuid | Y | 来源工单 ID | FK → delivery_orders |
+| purchase_contract_id | uuid | Y | 采购合同 ID | FK → contracts |
+| quantity_tons | decimal(12,3) | Y | 委托数量（吨） | > 0 |
+| unit_price | decimal(10,2) | Y | 单价（元/吨） | **必须等于采购合同的 unit_price**（同工单的强约束）|
+| extra_payment | decimal(12,2) | N | 额外支付金额（元） | 采购侧的额外费用 |
+| extra_payment_notes | text | N | 额外支付说明 | |
+| supplier_name_snapshot | varchar(200) | Y | 对应供应商名称（快照） | 冗余自合同 |
+| our_subject_snapshot | varchar(200) | Y | 对应主体公司（快照） | |
+| notes | text | N | 备注 | |
+| created_by, created_at, updated_by, updated_at, version | | Y | 通用审计字段 | |
+| deleted_at, deleted_by, deleted_reason | | N | 软删除字段 | |
+
+**unit_price 的强约束**: 同工单，unit_price 从采购合同自动拷贝不可手改，审计规则 `delegation_price_mismatch_check` 监测偏离。
+
+**数量守恒约束**（审计规则）:
+```
+对某工单 O:
+  SUM(delegations.quantity_tons WHERE source_order_id=O AND status='normal' AND deleted_at IS NULL)
+  = O.quantity_tons
+  （允许 0.001 吨误差）
+
+对某采购合同 C:
+  SUM(delegations.quantity_tons WHERE purchase_contract_id=C AND status='normal' AND deleted_at IS NULL)
+  ≤ C.quantity_tons
+```
+
+### 10.5 索引
+
+```sql
+CREATE INDEX idx_delegations_status ON delivery_delegations(status);
+CREATE INDEX idx_delegations_order ON delivery_delegations(source_order_id);
+CREATE INDEX idx_delegations_contract ON delivery_delegations(purchase_contract_id);
+CREATE INDEX idx_delegations_created_at ON delivery_delegations(created_at DESC);
+CREATE INDEX idx_delegations_deleted_at ON delivery_delegations(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE UNIQUE INDEX idx_delegations_number_active 
+  ON delivery_delegations(delegation_number) WHERE deleted_at IS NULL;
+```
+
+---
+
+## 11. dispatches（车辆调度表）
+
+### 11.1 用途
+
+记录每一车实际发车的详细信息：司机、车牌、装载量、提货时间、**实际提了什么货**。调度是工单到委托之间的中枢：**工单 ↔ 调度 ↔ 委托**。
+
+### 11.2 业务说明
+
+**核心理念**: 调度表记录**物流事实**，不关心价格。价格由工单/委托按合同单价结算。
+
+- 一个工单可拆 1~N 车（每车 30-33 吨左右，所以大批量要拆车）
+- 调度有两种模式：**个人司机**（填司机姓名、身份证、手机）或 **物流公司**（车牌号字段填物流公司名）
+- 调度的品牌/型号/提货地是**实际物流记录**，可能与合同约定不同（业务允许调整，不影响价格）
+
+### 11.3 调度记录的拆分规则（重要）
+
+**一条调度记录 = 同工单 + 同提货地 + 同品牌 + 同型号**的一车货。
+
+**提货地 / 品牌 / 型号 三个维度任一不同，必须拆成独立调度记录**。
+
+拆分场景举例：
+
+| 场景 | 工单（约定） | 实际提货情况 | 调度记录数 |
+|------|------------|------------|----------|
+| 单一 | 33 吨，三房 302，江阴 | 一车 33 吨 | 1 条 |
+| 多型号 | 33 吨，三房，江阴 | 22 吨 302 + 11 吨 328 | 2 条 |
+| 多品牌 | 33 吨，三房，江阴 | 22 吨三房 + 11 吨万凯（品牌调整）| 2 条 |
+| 多提货地 | 66 吨，三房 302 | 33 吨江阴 + 33 吨海宁 | 2 条 |
+| 全换维度 | 33 吨，三房 302 江阴 | 22 吨三房 302 江阴 + 11 吨万凯 318 海宁 | 2 条 |
+
+**业务原因**：
+- 每条调度最终都会输出一份"提货委托书"作为凭证，不同提货地/品牌/型号的凭证必须独立
+- 可能从不同上游采购合同提货，需要对应不同的提货委托
+
+**系统价格处理**：品牌/型号变化**不影响价格**。所有提货量最终按合同单价结算。这让调度可以灵活调整物流，不牵动财务。
+
+### 11.4 合同约定 vs 实际调度的差异
+
+合同约定品牌是三房，实际调度拉了万凯——这是合法的业务行为（可能因为库存紧张或调货方便）。
+
+**但审计系统会发现并提醒**：
+- `dispatch_brand_deviation_check` - 调度品牌 ≠ 合同品牌 → 提醒（非错误）
+- `dispatch_product_deviation_check` - 调度型号 ≠ 合同型号 → 提醒
+- `dispatch_location_deviation_check` - 调度提货地 ≠ 合同提货地 → 提醒
+
+这些提醒不是错误，只是让业务员/财务知情（可能涉及后续对账或税务处理）。
+
+### 11.5 编号规则
+
+`DD-YYYYMMDD-NNN` 或 `DD-YYYYMMDD-NNN-X`（按拆分规则需要拆时）
+
+例：
+- `DD-20260405-001`（工单不需要拆）
+- `DD-20260405-001-A`, `DD-20260405-001-B`（同工单拆了）
+
+### 11.6 字段定义
+
+| 字段名 | 类型 | 必填 | 含义 | 说明 |
+|--------|------|------|------|------|
+| id | uuid | Y | 主键 | |
+| dispatch_number | varchar(50) | Y | 调度编号 | 部分唯一索引 |
+| delivery_order_id | uuid | Y | 关联提货工单 | FK → delivery_orders（一条调度挂一个工单）|
+| delegation_id | uuid | N | 关联提货委托 | FK → delivery_delegations（业务上后填）|
+| dispatch_mode | enum | Y | 调度方式 | `driver`（个人司机）/ `logistics`（物流公司）|
+| driver_name | varchar(50) | N | 司机姓名 | driver 模式填 |
+| driver_id_number | varchar(30) | N | 身份证号 | driver 模式填，建议加密存储 |
+| driver_phone | varchar(20) | N | 手机号 | |
+| license_plate | varchar(30) | N | 车牌号 / 物流公司名 | driver 填车牌，logistics 填公司名 |
+| load_tons | decimal(12,3) | Y | 本车装载量（吨） | > 0 |
+| delivery_date | date | Y | 提货日期 | |
+| brand_id | uuid | Y | 实际提货品牌 | FK → brands |
+| product_model | varchar(100) | N | 实际提货型号 | |
+| delivery_location_id | uuid | Y | 实际提货地 | FK → delivery_locations |
+| notes | text | N | 备注 | 一车多货时标注拆分原因 |
+| created_by, created_at, updated_by, updated_at, version | | Y | 通用审计字段 | |
+| deleted_at, deleted_by, deleted_reason | | N | 软删除字段 | |
+
+**关键说明**：
+- `brand_id` / `product_model` / `delivery_location_id` 是**实际物流事实**，不是从合同快照的
+- 业务允许这些字段与合同约定不同
+- 打印"提货委托书"时使用这些字段的值作为凭证内容
+
+**dispatch_mode 条件必填规则**:
+```
+IF dispatch_mode = 'driver':
+    driver_name, driver_id_number, driver_phone, license_plate 建议都填
+    (允许为空，业务上推荐必填但数据库不强制)
+    
+IF dispatch_mode = 'logistics':
+    license_plate 必填（填物流公司名或车队名）
+    driver_name, driver_id_number, driver_phone 可为 NULL（物流场景不需要）
+```
+
+**数量守恒约束**（审计规则）:
+```
+对某工单 O:
+  SUM(dispatches.load_tons WHERE delivery_order_id=O AND deleted_at IS NULL)
+  = O.quantity_tons（允许 0.001 吨误差）
+
+对某委托 D:
+  SUM(dispatches.load_tons WHERE delegation_id=D AND deleted_at IS NULL)
+  ≤ D.quantity_tons
+```
+
+### 11.7 索引
+
+```sql
+CREATE INDEX idx_dispatches_order ON dispatches(delivery_order_id);
+CREATE INDEX idx_dispatches_delegation ON dispatches(delegation_id);
+CREATE INDEX idx_dispatches_date ON dispatches(delivery_date DESC);
+CREATE INDEX idx_dispatches_deleted_at ON dispatches(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE UNIQUE INDEX idx_dispatches_number_active 
+  ON dispatches(dispatch_number) WHERE deleted_at IS NULL;
+```
+
+### 11.8 历史数据导入注意
+
+原飞书调度表字段 "关联提货工单" 是单值字符串，导入时直接映射为 `delivery_order_id`。
+原飞书工单表的 "车辆调度" 字段（逗号分隔）**不导入**——这个关联从调度表反向建立。
+
+---
+
+## 12. transactions（流水表）
+
+### 12.1 用途
+
+记录我方（主体 A / 主体 B）与外部公司之间的实际银行流水。**流水表是原始银行数据的忠实映射，是唯一的资金真源**。
+
+### 12.2 核心设计原则
+
+**原则 1：流水表只读，原始字段不可修改**
+
+- 唯一写入途径：`import_transactions` workflow（批量导入银行流水文件）
+- 原始字段（流水号、时间、我方、对方、方向、金额）一旦写入永久不变
+- 除软删除外，其他字段也不能改
+- PG 层通过 REVOKE DELETE 权限 + TRIGGER 多重保护
+
+**原则 2：不在流水表做对账关联**
+
+采用**汇总对账**模式，不对应具体合同：
+- 流水表不存 `contract_id` / `delivery_order_id` / `purpose` 等字段
+- 对账通过 **视图** 实现：按 `(我方主体 × 对方公司)` 汇总
+- 业务员关注的是"这个客户欠我们多少" / "这个供应商我们还欠多少"，这种汇总级问题
+- 不做流水到合同的逐笔匹配
+
+**原则 3：公司名规范化靠 company_aliases**
+
+合同里的"张家港辉凡新材料科技有限公司"和流水里的"张家港辉凡新材料"通过 aliases 表映射到同一实体。
+
+### 12.3 样本数据特征
+
+- 713 条记录（2026-02-28 到 2026-03-31）
+- 流水号格式：`TZYYYYMMDDNNNNN`（15 位定长，UNIQUE）
+- 我方主体：上海瞿谊（697 条）+ 安徽趋易（16 条）—— 与 `subject_a / subject_b` 对应
+- 每条记录原始表中同时有"收入"和"支出"字段（其中一个为 0），新系统合并为 `direction + amount`
+- 前 10 大对方：浙江塑界新材料、张家港辉凡、台州绿鼎红、江西乾财、安徽葆特等
+
+### 12.4 字段定义
+
+| 字段名 | 类型 | 必填 | 含义 | 说明 |
+|--------|------|------|------|------|
+| id | uuid | Y | 主键 | |
+| transaction_number | varchar(30) | Y | 流水号 | 部分唯一索引；格式 `TZYYYYMMDDNNNNN` |
+| transaction_time | timestamptz | Y | 交易时间 | 精确到秒 |
+| our_subject_company | enum | Y | 我方主体 | `subject_a` / `subject_b` |
+| counterparty_name | varchar(200) | Y | 对方公司名称 | 原始名称（可能与 companies 表不完全一致）|
+| direction | enum | Y | 方向 | `in`（收入）/ `out`（支出）|
+| amount | decimal(14,2) | Y | 金额（元） | > 0（统一正数存储）|
+| imported_at | timestamptz | Y | 导入时间 | 默认 now() |
+| imported_by | uuid | Y | 导入人 | FK → users |
+| import_batch_id | uuid | N | 导入批次 ID | 便于批次回溯 |
+| created_at, updated_at, version | | Y | 通用审计字段 | 注意无 created_by/updated_by（由 imported_by 代替）|
+| deleted_at, deleted_by, deleted_reason | | N | 软删除字段 | 见 0.5 |
+
+**注意**：流水表没有 `purpose` / `contract_id` / `order_id` / `delegation_id` / `reconciled` 字段。对账逻辑完全在视图层。
+
+### 12.5 不可修改保护
+
+**方法 1：PG 权限层（阻止物理删除）**
+```sql
+REVOKE DELETE ON transactions FROM app_user;
+```
+
+**方法 2：TRIGGER（阻止原始字段修改）**
+```sql
+CREATE OR REPLACE FUNCTION prevent_transaction_raw_update()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.transaction_number != OLD.transaction_number OR
+     NEW.transaction_time != OLD.transaction_time OR
+     NEW.our_subject_company != OLD.our_subject_company OR
+     NEW.counterparty_name != OLD.counterparty_name OR
+     NEW.direction != OLD.direction OR
+     NEW.amount != OLD.amount THEN
+    RAISE EXCEPTION '流水原始字段不可修改（流水表只读）';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER transactions_raw_immutable
+  BEFORE UPDATE ON transactions
+  FOR EACH ROW
+  EXECUTE FUNCTION prevent_transaction_raw_update();
+```
+
+**方法 3：应用层保护**
+- 只有 `import_transactions` workflow 能执行 INSERT
+- 不提供"修改流水"的 workflow 或 tool
+- AI 系统的工具白名单里没有"写流水"能力
+
+**唯一允许的变化**：软删除（`deleted_at` / `deleted_by` / `deleted_reason` 的更新）。
+
+### 12.6 索引
+
+```sql
+CREATE UNIQUE INDEX idx_transactions_number_active
+    ON transactions(transaction_number) WHERE deleted_at IS NULL;
+CREATE INDEX idx_transactions_time ON transactions(transaction_time DESC);
+CREATE INDEX idx_transactions_subject ON transactions(our_subject_company);
+CREATE INDEX idx_transactions_counterparty_trgm 
+    ON transactions USING gin(counterparty_name gin_trgm_ops);
+CREATE INDEX idx_transactions_subject_counterparty 
+    ON transactions(our_subject_company, counterparty_name);
+CREATE INDEX idx_transactions_deleted_at 
+    ON transactions(deleted_at) WHERE deleted_at IS NOT NULL;
+```
+
+### 12.7 完整 DDL
+
+```sql
+CREATE TYPE transaction_direction_enum AS ENUM ('in', 'out');
+
+CREATE TABLE transactions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- 原始银行流水字段（一旦写入不可修改）
+    transaction_number varchar(30) NOT NULL,
+    transaction_time timestamptz NOT NULL,
+    our_subject_company subject_company_enum NOT NULL,
+    counterparty_name varchar(200) NOT NULL,
+    direction transaction_direction_enum NOT NULL,
+    amount decimal(14,2) NOT NULL CHECK (amount > 0),
+    
+    -- 导入元信息
+    imported_at timestamptz NOT NULL DEFAULT now(),
+    imported_by uuid NOT NULL REFERENCES users(id),
+    import_batch_id uuid,
+    
+    -- 通用审计 + 软删除
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    version int NOT NULL DEFAULT 1,
+    deleted_at timestamptz,
+    deleted_by uuid REFERENCES users(id),
+    deleted_reason text,
+    
+    CONSTRAINT check_soft_delete_consistency CHECK (
+        (deleted_at IS NULL AND deleted_by IS NULL AND deleted_reason IS NULL) OR
+        (deleted_at IS NOT NULL AND deleted_by IS NOT NULL AND deleted_reason IS NOT NULL)
+    )
+);
+
+-- 索引（见 12.6）
+-- TRIGGER 见 12.5
+-- REVOKE DELETE ON transactions FROM app_user;
+```
+
+### 12.8 历史数据导入清洗规则
+
+原飞书"收入"和"支出"两列合并为 `direction + amount`:
+```
+IF 收入 > 0 AND 支出 = 0:
+    direction = 'in', amount = 收入
+ELIF 支出 > 0 AND 收入 = 0:
+    direction = 'out', amount = 支出
+ELSE:
+    异常行，单独记录到错误日志，不导入
+```
+
+"我方公司名称"映射：
+```
+"上海瞿谊实业有限公司" → subject_b
+"安徽趋易贸易有限公司" → subject_a
+其他 → 异常，单独记录
+```
+
+导入时批量使用同一个 `import_batch_id`，方便回溯。
+
+---
+
+## 12.9 对账视图（核心）
+
+对账逻辑完全通过视图实现，不在表结构中关联。
+
+### 视图 1：规范化后的流水
+
+通过 company_aliases 把"张家港辉凡新材料"映射到"张家港辉凡新材料科技有限公司"：
+
+```sql
+CREATE VIEW v_transactions_normalized AS
+SELECT
+    t.*,
+    COALESCE(
+        (SELECT c.formal_name 
+         FROM company_aliases ca 
+         JOIN companies c ON c.id = ca.company_id
+         WHERE ca.alias = t.counterparty_name 
+           AND ca.alias_type = 'common'
+         LIMIT 1),
+        -- 如果 counterparty_name 本身就是 companies.formal_name
+        (SELECT c.formal_name FROM companies c 
+         WHERE c.formal_name = t.counterparty_name 
+         LIMIT 1),
+        -- 找不到就用原名
+        t.counterparty_name
+    ) AS counterparty_formal_name
+FROM transactions t
+WHERE t.deleted_at IS NULL;
+```
+
+### 视图 2：按 (主体 × 对方公司) 汇总流水净额
+
+```sql
+CREATE VIEW v_transaction_balance_by_counterparty AS
+SELECT
+    our_subject_company,
+    counterparty_formal_name,
+    SUM(CASE WHEN direction = 'in' THEN amount ELSE 0 END) AS total_in,
+    SUM(CASE WHEN direction = 'out' THEN amount ELSE 0 END) AS total_out,
+    SUM(CASE WHEN direction = 'in' THEN amount ELSE -amount END) AS net_balance,
+    COUNT(*) AS transaction_count,
+    MIN(transaction_time) AS first_transaction_at,
+    MAX(transaction_time) AS last_transaction_at
+FROM v_transactions_normalized
+GROUP BY our_subject_company, counterparty_formal_name;
+```
+
+### 视图 3：按 (主体 × 对方公司) 汇总合同应收应付
+
+```sql
+CREATE VIEW v_contract_balance_by_counterparty AS
+WITH sales_side AS (
+    -- 销售类合同（我方作为卖方，对方是客户 = party_b）
+    SELECT
+        c.our_subject_company,
+        COALESCE(
+            (SELECT comp.formal_name FROM company_aliases ca
+             JOIN companies comp ON comp.id = ca.company_id
+             WHERE ca.alias = c.party_b_name AND ca.alias_type = 'common'
+             LIMIT 1),
+            c.party_b_name
+        ) AS counterparty_formal_name,
+        SUM(COALESCE(a.receivable_amount, 0)) AS total_receivable,
+        CAST(0 AS decimal(14,2)) AS total_payable
+    FROM v_contracts_with_aggregates a
+    JOIN contracts c ON c.id = a.id
+    WHERE c.our_role IN ('seller', 'lender')
+      AND c.our_subject_company IS NOT NULL
+    GROUP BY c.our_subject_company, counterparty_formal_name
+),
+purchase_side AS (
+    -- 采购类合同（我方作为买方，对方是供应商 = party_a）
+    SELECT
+        c.our_subject_company,
+        COALESCE(
+            (SELECT comp.formal_name FROM company_aliases ca
+             JOIN companies comp ON comp.id = ca.company_id
+             WHERE ca.alias = c.party_a_name AND ca.alias_type = 'common'
+             LIMIT 1),
+            c.party_a_name
+        ) AS counterparty_formal_name,
+        CAST(0 AS decimal(14,2)) AS total_receivable,
+        SUM(COALESCE(a.payable_amount, 0)) AS total_payable
+    FROM v_contracts_with_aggregates a
+    JOIN contracts c ON c.id = a.id
+    WHERE c.our_role IN ('buyer', 'borrower')
+      AND c.our_subject_company IS NOT NULL
+    GROUP BY c.our_subject_company, counterparty_formal_name
+)
+SELECT
+    our_subject_company,
+    counterparty_formal_name,
+    SUM(total_receivable) AS total_receivable,
+    SUM(total_payable) AS total_payable,
+    SUM(total_receivable) - SUM(total_payable) AS net_expected
+FROM (
+    SELECT * FROM sales_side
+    UNION ALL
+    SELECT * FROM purchase_side
+) combined
+GROUP BY our_subject_company, counterparty_formal_name;
+```
+
+### 视图 4：最终对账视图
+
+合同应收应付 vs 流水实收实付的对比：
+
+```sql
+CREATE VIEW v_reconciliation AS
+SELECT
+    COALESCE(c.our_subject_company, t.our_subject_company) AS our_subject_company,
+    COALESCE(c.counterparty_formal_name, t.counterparty_formal_name) AS counterparty_formal_name,
+    
+    -- 合同应收应付（期望值）
+    COALESCE(c.total_receivable, 0) AS total_receivable,
+    COALESCE(c.total_payable, 0) AS total_payable,
+    COALESCE(c.net_expected, 0) AS net_expected,
+    
+    -- 流水实际收付
+    COALESCE(t.total_in, 0) AS total_received,
+    COALESCE(t.total_out, 0) AS total_paid,
+    COALESCE(t.net_balance, 0) AS net_actual,
+    
+    -- 差额：期望 vs 实际
+    COALESCE(c.net_expected, 0) - COALESCE(t.net_balance, 0) AS difference,
+    
+    -- 对账状态分类
+    CASE 
+        WHEN ABS(COALESCE(c.net_expected, 0) - COALESCE(t.net_balance, 0)) < 1 
+            THEN 'balanced'          -- 对平
+        WHEN ABS(COALESCE(c.net_expected, 0) - COALESCE(t.net_balance, 0)) < 100 
+            THEN 'minor_difference'  -- 微小差额（可能是四舍五入）
+        ELSE 'significant_difference' -- 显著差额，需人工核查
+    END AS status
+    
+FROM v_contract_balance_by_counterparty c
+FULL OUTER JOIN v_transaction_balance_by_counterparty t
+    ON c.our_subject_company = t.our_subject_company
+    AND c.counterparty_formal_name = t.counterparty_formal_name;
+```
+
+**三种 FULL OUTER JOIN 场景**：
+- 合同有，流水没有：客户签了合同还没付款（应收为正，实收为 0）
+- 流水有，合同没有：预付款先到、合同未录入、或该对方公司无合同（常见于借款/非业务往来）
+- 两者都有：正常对账场景
+
+### 视图的查询示例
+
+```sql
+-- 所有差额 > 1000 元的对账问题
+SELECT * FROM v_reconciliation 
+WHERE status = 'significant_difference' 
+  AND ABS(difference) > 1000
+ORDER BY ABS(difference) DESC;
+
+-- 主体 B 和"美远贸易"的对账
+SELECT * FROM v_reconciliation 
+WHERE our_subject_company = 'subject_b'
+  AND counterparty_formal_name LIKE '%美远%';
+
+-- 主体 B 所有欠款（实收 < 应收的情况）
+SELECT * FROM v_reconciliation
+WHERE our_subject_company = 'subject_b'
+  AND difference > 0  -- 期望 > 实际 = 对方欠我们
+ORDER BY difference DESC;
+```
+
+### 性能考量
+
+对账视图涉及多表 JOIN 和 aliases 子查询，数据量大时可能慢。Phase 1 先用 VIEW，Phase 2 如果性能不够：
+- 改为 materialized view（物化视图），定时刷新
+- 或者加单独的 `reconciliation_cache` 表，通过定时任务更新
+
+目前 250 合同 + 700 流水的数据量，普通 VIEW 足够。
+
+---
+
+## 13. fee_adjustments（费用调整规则表，可选）
+
+### 13.1 用途
+
+记录"特殊型号加价"、"特殊仓库加减价"这类规则，AI 生成工单时可自动计算额外费用。
+
+**Phase 1 可暂时不实现**，业务员手工填写 `extra_fee` 字段并在 `extra_fee_notes` 里说明。Phase 2 再考虑规则化。
+
+---
+
+## 14. 审计表（Audit 三件套）
+
+### 14.1 audit_logs（审计日志）
+
+**用途**：每次执行 Plan（增删改数据）记录一笔完整执行日志。
+
+**写入时机**：`ProposalExecutor.execute()` 在事务内写入。
+
+**特性**：只允许 INSERT + SELECT。
+
+```sql
+CREATE TABLE audit_logs (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id uuid REFERENCES change_proposals(id),
+    conversation_id uuid REFERENCES conversations(id),
+    message_id uuid REFERENCES messages(id),       -- 触发操作的用户消息
+    workflow_name varchar(100) NOT NULL,
+    workflow_version varchar(20) NOT NULL,
+    user_id uuid NOT NULL REFERENCES users(id),
+    operations jsonb NOT NULL,                      -- 执行了哪些 operation
+    status varchar(20) NOT NULL,                    -- success / failed / rolled_back
+    error_message text,
+    executed_at timestamptz NOT NULL,
+    duration_ms int
+);
+
+CREATE INDEX idx_audit_logs_user ON audit_logs(user_id, executed_at DESC);
+CREATE INDEX idx_audit_logs_plan ON audit_logs(plan_id);
+CREATE INDEX idx_audit_logs_workflow ON audit_logs(workflow_name, executed_at DESC);
+CREATE INDEX idx_audit_logs_conversation ON audit_logs(conversation_id);
+
+REVOKE UPDATE, DELETE ON audit_logs FROM app_user;
+```
+
+### 14.2 change_proposals（操作提案表）
+
+**用途**：存储 AI 为业务员生成的 Plan（操作方案），待确认、审批、执行。
+
+**写入时机**：workflow 的 `plan()` 函数生成方案时。
+
+```sql
+CREATE TYPE proposal_status_enum AS ENUM (
+    'draft',               -- 草稿（规则校验未通过）
+    'pending_confirm',     -- 待用户确认
+    'pending_approval',    -- 待审批
+    'approved',            -- 审批通过（等待执行）
+    'executing',           -- 执行中
+    'completed',           -- 执行成功
+    'cancelled',           -- 用户取消
+    'rejected',            -- 审批拒绝
+    'failed'               -- 执行失败
+);
+
+CREATE TABLE change_proposals (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workflow_name varchar(100) NOT NULL,
+    workflow_version varchar(20) NOT NULL,
+    params jsonb NOT NULL,                          -- workflow 的输入参数
+    operations jsonb NOT NULL,                      -- 待执行的 insert/update/delete 列表
+    violations jsonb,                               -- 规则校验违规项
+    required_approvers jsonb,                       -- 需要的审批人列表
+    status proposal_status_enum NOT NULL DEFAULT 'draft',
+    created_by uuid NOT NULL REFERENCES users(id),
+    conversation_id uuid REFERENCES conversations(id),
+    confirmed_at timestamptz,
+    confirmed_by uuid REFERENCES users(id),
+    executed_at timestamptz,
+    audit_log_id uuid REFERENCES audit_logs(id),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_proposals_status ON change_proposals(status, created_at DESC);
+CREATE INDEX idx_proposals_user ON change_proposals(created_by, created_at DESC);
+CREATE INDEX idx_proposals_conversation ON change_proposals(conversation_id);
+```
+
+### 14.3 approval_records（审批记录）
+
+**用途**：Plan 需要审批时的审批过程记录。
+
+**写入时机**：Plan 需要审批时为每个审批人创建一条 pending 记录，审批人决定时更新 decision。
+
+```sql
+CREATE TYPE approval_decision_enum AS ENUM (
+    'pending', 'approved', 'rejected', 'delegated'
+);
+
+CREATE TABLE approval_records (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id uuid NOT NULL REFERENCES change_proposals(id),
+    approver_user_id uuid NOT NULL REFERENCES users(id),
+    approver_role varchar(50),
+    sequence int NOT NULL,                          -- 第几级审批（1/2/3）
+    decision approval_decision_enum NOT NULL DEFAULT 'pending',
+    comment text,
+    decided_at timestamptz,
+    card_message_id varchar(100),                   -- 飞书卡片消息 ID
+    original_approver_id uuid REFERENCES users(id), -- 请假转移时的原审批人
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_approvals_plan ON approval_records(plan_id);
+CREATE INDEX idx_approvals_approver ON approval_records(approver_user_id, decision);
+CREATE INDEX idx_approvals_pending ON approval_records(decision) WHERE decision = 'pending';
+```
+
+---
+
+## 15. History 表（每个业务表一张）
+
+### 15.1 通用规范
+
+每个业务表（contracts / delivery_orders / delivery_delegations / dispatches / transactions）都有对应的 history 表，结构统一：
+
+```sql
+CREATE TABLE <table>_history (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id uuid NOT NULL,                        -- 指向原表的 id
+    op_type varchar(20) NOT NULL,                   -- insert / update / soft_delete / restore
+    before_snapshot jsonb,                          -- 操作前完整行（JSON）
+    after_snapshot jsonb,                           -- 操作后完整行
+    changed_fields text[],                          -- 变更了哪些字段
+    changed_at timestamptz NOT NULL DEFAULT now(),
+    changed_by uuid REFERENCES users(id),
+    audit_log_id uuid REFERENCES audit_logs(id)     -- 关联到审计日志
+);
+CREATE INDEX idx_<table>_history_record ON <table>_history(record_id, changed_at DESC);
+REVOKE UPDATE, DELETE ON <table>_history FROM app_user;
+```
+
+具体表：
+- `contracts_history`
+- `delivery_orders_history`
+- `delivery_delegations_history`
+- `dispatches_history`
+- `transactions_history`
+
+### 15.2 op_type 枚举说明
+
+- `insert` - 新建记录
+- `update` - 修改字段
+- `soft_delete` - 软删除（deleted_at 填入时间戳）
+- `restore` - 恢复误删（deleted_at 置回 NULL）
+
+注意：物理删除（DELETE FROM ...）被 PG 权限阻止，所以不会有 `delete` 类型。
+
+### 15.3 写入规范
+
+**Executor 在事务内显式写入**（不用 DB TRIGGER，便于关联审计上下文）：
+
+```python
+async def execute_operation(op, audit_log_id, user_id, db):
+    model = get_model_by_table(op.table)
+    history_model = get_history_model(op.table)
+    
+    if op.op_type == "insert":
+        record = model(**op.after)
+        db.add(record)
+        await db.flush()
+        # 同事务写 history
+        db.add(history_model(
+            record_id=record.id,
+            op_type='insert',
+            before_snapshot=None,
+            after_snapshot=record.to_dict(),
+            changed_fields=list(op.after.keys()),
+            changed_by=user_id,
+            audit_log_id=audit_log_id,
+        ))
+    elif op.op_type == "update":
+        record = await db.get(model, op.record_id, with_for_update=True)
+        before = record.to_dict()
+        for k, v in op.after.items():
+            setattr(record, k, v)
+        record.version += 1
+        record.updated_by = user_id
+        record.updated_at = now()
+        after = record.to_dict()
+        db.add(history_model(
+            record_id=record.id,
+            op_type='update',
+            before_snapshot=before,
+            after_snapshot=after,
+            changed_fields=[k for k in op.after.keys() if before.get(k) != after.get(k)],
+            changed_by=user_id,
+            audit_log_id=audit_log_id,
+        ))
+```
+
+---
+
+## 16. AI 运行表
+
+### 16.1 conversations（对话表）
+
+**用途**：记录对话会话（30 分钟无活动自动开新对话）。
+
+```sql
+CREATE TABLE conversations (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id),
+    started_at timestamptz NOT NULL DEFAULT now(),
+    last_activity_at timestamptz NOT NULL DEFAULT now(),
+    ended_at timestamptz,
+    title varchar(200),                 -- AI 自动总结的主题
+    summary text,                       -- 长对话的压缩摘要
+    message_count int DEFAULT 0
+);
+
+CREATE INDEX idx_conversations_user_activity 
+    ON conversations(user_id, last_activity_at DESC);
+CREATE INDEX idx_conversations_active 
+    ON conversations(last_activity_at DESC) WHERE ended_at IS NULL;
+```
+
+### 16.2 messages（消息表）
+
+**用途**：对话里的每条消息（用户的、AI 的、工具调用的、工具返回的）。
+
+```sql
+CREATE TYPE message_role_enum AS ENUM (
+    'user', 'assistant', 'tool_call', 'tool_result', 'system'
+);
+
+CREATE TABLE messages (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id uuid NOT NULL REFERENCES conversations(id),
+    role message_role_enum NOT NULL,
+    content jsonb NOT NULL,
+    tool_name varchar(100),            -- 工具调用时填
+    tool_input jsonb,
+    tool_output jsonb,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_messages_conversation ON messages(conversation_id, created_at);
+```
+
+### 16.3 pending_issues（待办异常）
+
+**用途**：审计引擎发现的问题，分配给责任人处理。支持自愈（问题消失自动关闭）。
+
+```sql
+CREATE TYPE issue_status_enum AS ENUM (
+    'open', 'resolved', 'manual_override'
+);
+
+CREATE TABLE pending_issues (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    rule_name varchar(100) NOT NULL,
+    issue_key varchar(200) NOT NULL,                -- 去重用的唯一标识
+    category varchar(50),
+    severity varchar(20) NOT NULL,                  -- low / medium / high
+    title varchar(300) NOT NULL,
+    description text,
+    affected_records jsonb,                         -- 涉及的记录 ID 列表
+    owner_user_ids uuid[] NOT NULL,                 -- 分配给谁处理（可多人）
+    status issue_status_enum NOT NULL DEFAULT 'open',
+    first_detected_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    resolved_at timestamptz,
+    resolution_method varchar(30),                  -- auto_resolved / manual_override
+    detection_count int NOT NULL DEFAULT 1,
+    
+    CONSTRAINT check_resolved_consistency CHECK (
+        (status = 'open') OR 
+        (status IN ('resolved', 'manual_override') AND resolved_at IS NOT NULL)
+    )
+);
+
+-- open 状态的 issue_key 必须唯一（防止重复创建）
+CREATE UNIQUE INDEX idx_pending_issues_key_open 
+    ON pending_issues(issue_key) WHERE status = 'open';
+
+CREATE INDEX idx_pending_issues_owner ON pending_issues USING gin(owner_user_ids);
+CREATE INDEX idx_pending_issues_status_time ON pending_issues(status, last_seen_at DESC);
+CREATE INDEX idx_pending_issues_rule ON pending_issues(rule_name, status);
+```
+
+**核心自愈逻辑**（审计引擎伪码）：
+
+```python
+def run_audit_rule(rule):
+    with db.begin():
+        violations = rule.check(db)
+        detected_keys = set()
+        
+        for v in violations:
+            key = rule.generate_issue_key(v)
+            detected_keys.add(key)
+            
+            existing = db.query(PendingIssue)\
+                .filter_by(issue_key=key, status='open').first()
+            
+            if existing:
+                existing.last_seen_at = now()
+                existing.detection_count += 1
+            else:
+                db.add(PendingIssue(...))
+        
+        # 自愈：之前 open 但这次没发现的 → resolved
+        stale = db.query(PendingIssue)\
+            .filter_by(rule_name=rule.name, status='open')\
+            .filter(PendingIssue.issue_key.notin_(detected_keys))\
+            .all()
+        for issue in stale:
+            issue.status = 'resolved'
+            issue.resolved_at = now()
+            issue.resolution_method = 'auto_resolved'
+```
+
+### 16.4 tool_call_logs（工具调用日志）
+
+**用途**：记录 AI 每次调用工具的详细日志，便于审计和调试。
+
+```sql
+CREATE TABLE tool_call_logs (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id uuid REFERENCES conversations(id),
+    message_id uuid REFERENCES messages(id),
+    user_id uuid REFERENCES users(id),
+    tool_name varchar(100) NOT NULL,
+    tool_input jsonb,
+    tool_output jsonb,
+    duration_ms int,
+    status varchar(20) NOT NULL,                    -- success / failed
+    error_message text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_tool_calls_conversation ON tool_call_logs(conversation_id);
+CREATE INDEX idx_tool_calls_tool ON tool_call_logs(tool_name, created_at DESC);
+CREATE INDEX idx_tool_calls_user ON tool_call_logs(user_id, created_at DESC);
+```
+
+---
+
+## 17. 配置与辅助表
+
+### 17.1 user_permissions（用户权限表）
+
+```sql
+CREATE TABLE user_permissions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id),
+    workflow_name varchar(100) NOT NULL,
+    scope_filter jsonb,                    -- 例: {"owner_user_id": "$user_id"}
+    allowed boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, workflow_name)
+);
+```
+
+### 17.2 approval_rules（审批规则表）
+
+```sql
+CREATE TABLE approval_rules (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name varchar(100) NOT NULL,
+    workflow_name varchar(100) NOT NULL,
+    match_condition jsonb,                 -- 触发条件（如 amount > 10000）
+    approvers jsonb NOT NULL,              -- 审批人列表（角色 + 顺序）
+    priority int NOT NULL DEFAULT 0,
+    enabled boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_approval_rules_workflow 
+    ON approval_rules(workflow_name, priority DESC) 
+    WHERE enabled = true;
+```
+
+### 17.3 audit_rule_configs（审计规则配置）
+
+```sql
+CREATE TABLE audit_rule_configs (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    rule_name varchar(100) NOT NULL UNIQUE,
+    cron_expression varchar(50) NOT NULL,  -- APScheduler 格式
+    enabled boolean NOT NULL DEFAULT true,
+    config_json jsonb,                     -- 规则特定配置
+    last_run_at timestamptz,
+    last_run_status varchar(20),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+### 17.4 role_holders（角色持有人）
+
+用于审批流中解析"销售主管"这类角色对应的具体用户。
+
+```sql
+CREATE TABLE role_holders (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    role_name varchar(50) NOT NULL,
+    user_id uuid NOT NULL REFERENCES users(id),
+    effective_from date NOT NULL,
+    effective_to date,
+    is_primary boolean NOT NULL DEFAULT true,
+    notes text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_role_holders_lookup 
+    ON role_holders(role_name, effective_from, effective_to);
+```
+
+### 17.5 leave_records（请假记录）
+
+用于审批流的自动转移。
+
+```sql
+CREATE TABLE leave_records (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id),
+    leave_from date NOT NULL,
+    leave_to date NOT NULL,
+    delegate_user_id uuid REFERENCES users(id),  -- 委托给谁处理审批
+    reason text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (leave_to >= leave_from)
+);
+
+CREATE INDEX idx_leave_records_user 
+    ON leave_records(user_id, leave_from, leave_to);
+```
+
+---
+
+---
+
+## 完整的 CREATE TABLE 语句（合同表）
+
+```sql
+-- 启用 PG 扩展
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Enum 类型
+CREATE TYPE contract_type_enum AS ENUM (
+    'sales', 'purchase', 
+    'brokering', 'brokering_sales', 'brokering_purchase',
+    'lending_sales', 'lending_purchase'
+);
+
+CREATE TYPE contract_status_enum AS ENUM (
+    'not_started', 'in_progress', 'completed', 'cancelled'
+);
+
+CREATE TYPE subject_company_enum AS ENUM ('subject_a', 'subject_b');
+
+CREATE TYPE contract_role_enum AS ENUM (
+    'seller', 'buyer', 'broker_only', 'lender', 'borrower'
+);
+
+CREATE TYPE margin_type_enum AS ENUM ('full', 'fixed_ratio', 'fixed_amount');
+
+CREATE TYPE margin_deduction_mode_enum AS ENUM ('proportional', 'at_end');
+
+CREATE TYPE delivery_method_enum AS ENUM ('self_pickup', 'shipped');
+
+-- 合同主表
+CREATE TABLE contracts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- 标识（注意：contract_number 不在这里加 UNIQUE，而是通过部分唯一索引实现）
+    contract_number varchar(50) NOT NULL,
+    
+    -- 分类
+    contract_type contract_type_enum NOT NULL,
+    contract_status contract_status_enum NOT NULL DEFAULT 'not_started',
+    
+    -- 主体与角色
+    our_subject_company subject_company_enum,  -- brokering 类型时为 NULL
+    our_role contract_role_enum NOT NULL,
+    
+    -- 交易对手
+    party_a_name varchar(200) NOT NULL,
+    party_a_company_id uuid REFERENCES companies(id),
+    party_b_name varchar(200) NOT NULL,
+    party_b_company_id uuid REFERENCES companies(id),
+    
+    -- 业务员
+    salesperson_user_id uuid REFERENCES users(id),
+    broker_party_a_user_id uuid REFERENCES users(id),
+    broker_party_b_user_id uuid REFERENCES users(id),
+    
+    -- 商品
+    brand_id uuid NOT NULL REFERENCES brands(id),
+    product_model varchar(100),
+    quantity_tons decimal(12,3) NOT NULL CHECK (quantity_tons > 0),
+    unit_price decimal(10,2) CHECK (unit_price IS NULL OR unit_price > 0),
+    delivery_location_id uuid NOT NULL REFERENCES delivery_locations(id),
+    
+    -- 时间
+    signed_date date NOT NULL,
+    valid_from date NOT NULL,
+    valid_to date NOT NULL CHECK (valid_to > valid_from),
+    
+    -- 保证金
+    margin_type margin_type_enum,
+    fixed_ratio decimal(5,4) CHECK (fixed_ratio IS NULL OR (fixed_ratio > 0 AND fixed_ratio <= 1)),
+    fixed_amount decimal(12,2) CHECK (fixed_amount IS NULL OR fixed_amount > 0),
+    margin_deduction_mode margin_deduction_mode_enum,
+    
+    -- 交付方式
+    delivery_method delivery_method_enum,
+    freight_per_ton_incl_tax decimal(8,2) CHECK (freight_per_ton_incl_tax IS NULL OR freight_per_ton_incl_tax >= 0),
+    find_truck_freight_excl_tax decimal(10,2) CHECK (find_truck_freight_excl_tax IS NULL OR find_truck_freight_excl_tax >= 0),
+    
+    -- 金额
+    total_amount decimal(14,2) NOT NULL CHECK (total_amount >= 0),
+    
+    -- 撮合佣金
+    commission_per_ton_party_a decimal(8,2) CHECK (commission_per_ton_party_a IS NULL OR commission_per_ton_party_a >= 0),
+    commission_per_ton_party_b decimal(8,2) CHECK (commission_per_ton_party_b IS NULL OR commission_per_ton_party_b >= 0),
+    
+    -- 其他
+    notes text,
+    attachments jsonb,
+    
+    -- 审计
+    created_by uuid NOT NULL REFERENCES users(id),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_by uuid NOT NULL REFERENCES users(id),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    version int NOT NULL DEFAULT 1,
+    
+    -- 软删除
+    deleted_at timestamptz,
+    deleted_by uuid REFERENCES users(id),
+    deleted_reason text,
+    
+    -- 跨字段约束
+    CONSTRAINT check_brokering_no_subject CHECK (
+        (contract_type = 'brokering' AND our_subject_company IS NULL) OR
+        (contract_type != 'brokering' AND our_subject_company IS NOT NULL)
+    ),
+    CONSTRAINT check_margin_type_consistency CHECK (
+        (margin_type = 'full' AND fixed_ratio IS NULL AND fixed_amount IS NULL 
+         AND margin_deduction_mode IS NULL) OR
+        (margin_type = 'fixed_ratio' AND fixed_ratio IS NOT NULL AND fixed_amount IS NULL 
+         AND margin_deduction_mode IS NOT NULL) OR
+        (margin_type = 'fixed_amount' AND fixed_amount IS NOT NULL AND fixed_ratio IS NULL 
+         AND margin_deduction_mode IS NOT NULL) OR
+        (margin_type IS NULL AND fixed_ratio IS NULL AND fixed_amount IS NULL 
+         AND margin_deduction_mode IS NULL)
+    ),
+    CONSTRAINT check_brokering_commissions CHECK (
+        (contract_type LIKE 'brokering%' AND 
+         commission_per_ton_party_a IS NOT NULL AND 
+         commission_per_ton_party_b IS NOT NULL)
+        OR
+        (contract_type NOT LIKE 'brokering%' AND 
+         commission_per_ton_party_a IS NULL AND 
+         commission_per_ton_party_b IS NULL)
+    ),
+    -- 软删除三字段必须一起赋值或一起为空
+    CONSTRAINT check_soft_delete_consistency CHECK (
+        (deleted_at IS NULL AND deleted_by IS NULL AND deleted_reason IS NULL) OR
+        (deleted_at IS NOT NULL AND deleted_by IS NOT NULL AND deleted_reason IS NOT NULL)
+    )
+);
+
+-- 索引
+CREATE INDEX idx_contracts_type ON contracts(contract_type);
+CREATE INDEX idx_contracts_status ON contracts(contract_status);
+CREATE INDEX idx_contracts_subject ON contracts(our_subject_company);
+CREATE INDEX idx_contracts_salesperson ON contracts(salesperson_user_id);
+CREATE INDEX idx_contracts_broker_a ON contracts(broker_party_a_user_id);
+CREATE INDEX idx_contracts_broker_b ON contracts(broker_party_b_user_id);
+CREATE INDEX idx_contracts_signed_date ON contracts(signed_date DESC);
+CREATE INDEX idx_contracts_valid_range ON contracts(valid_from, valid_to);
+CREATE INDEX idx_contracts_brand ON contracts(brand_id);
+CREATE INDEX idx_contracts_party_a_trgm ON contracts USING gin(party_a_name gin_trgm_ops);
+CREATE INDEX idx_contracts_party_b_trgm ON contracts USING gin(party_b_name gin_trgm_ops);
+CREATE INDEX idx_contracts_salesperson_status ON contracts(salesperson_user_id, contract_status);
+
+-- 软删除相关
+CREATE INDEX idx_contracts_deleted_at ON contracts(deleted_at) WHERE deleted_at IS NOT NULL;
+-- 部分唯一索引：合同号在未删除记录间唯一
+CREATE UNIQUE INDEX idx_contracts_number_active
+    ON contracts(contract_number) WHERE deleted_at IS NULL;
+
+-- PG 权限（阻止物理删除）
+-- 应用层角色只有 SELECT, INSERT, UPDATE 权限，没有 DELETE
+REVOKE DELETE ON contracts FROM app_user;
+```
+
+---
+
+## 设计决策记录（重要）
+
+以下设计决策经过讨论已定稿，Codex 开发时严格遵守：
+
+1. **聚合字段不存储，通过 VIEW 运行时计算**
+   - 已提货量、敞口库存、应收应付、总佣金、保证金金额
+   - 彻底避免数据不一致
+   
+2. **甲方乙方保留文本 + 软关联 company_id**
+   - 不强制要求每条合同的对方公司都在 companies 表中
+   - 支持逐步规范化
+   
+3. **our_subject_company 只有 subject_a / subject_b 两个值**
+   - 撮合主体 C（骋子次方）不入数据
+   - brokering 类型合同此字段为 NULL
+   - 主体 A 和 B 之间无内部交易
+   
+4. **借货合同用同一套 schema，语义层面区分**
+   - 不独立建表
+   - 借货合同只计算保证金 + 额外费用，不计算货款应收应付
+
+5. **合同编号不做格式校验，仅对未删除记录强制唯一**
+   - 部分唯一索引 `WHERE deleted_at IS NULL`
+   - 由业务员自行维护编号规则
+   
+6. **应收应付通过 VIEW 计算，不存字段**
+   - 四种分支：借货 / 全款 / 按比例扣除 / 最后扣除
+   - 每次查询都是最新值
+   - 撮合纯中介不计算应收应付（只计算佣金）
+
+7. **严禁物理删除，全局软删除机制**
+   - 所有业务表带 `deleted_at / deleted_by / deleted_reason`
+   - 区分"作废"（contract_status=cancelled）vs "删除"（deleted_at 有值）
+   - 主数据表用 `is_active`
+   
+8. **状态流转受约束**
+   - 软删除后禁止更新（除恢复操作）
+   - 恢复前检查号码冲突
+
+9. **工单-调度-委托的关联方向**
+   - 工单表不存调度列表
+   - 调度表持有 `delivery_order_id` 和 `delegation_id`
+   - 委托表持有 `source_order_id`
+
+10. **调度拆分规则：三维度任一不同都拆分**（v0.5 新增）
+    - 拆分维度：提货地 / 品牌 / 型号
+    - 任一维度不同 → 新建独立调度记录
+    - 编号规则：`DD-YYYYMMDD-NNN-A/-B/-C`
+    - 调度的品牌/型号/提货地是**实际物流记录**，可与合同约定不同
+
+11. **价格模型锁定：合同单价是真源**（v0.5 新增）
+    - 合同的 quantity_tons 和 unit_price 是价格体系的真源
+    - 工单/委托的 unit_price 必须等于对应合同的 unit_price
+    - 业务员创建工单/委托时 unit_price 自动拷贝，不允许手改
+    - 改价必须通过"修改合同"workflow，不允许在工单/委托绕过
+    - 品牌/型号/提货地的灵活调整不影响价格
+    - 额外费用通过 `extra_fee` / `extra_payment` 字段记录，独立于单价
+
+12. **流水表只读 + 汇总对账模式**（v0.6 新增）
+    - transactions 只有 `import_transactions` workflow 能写
+    - 原始字段（流水号/时间/主体/对方/方向/金额）一旦写入永久不变（TRIGGER 保护）
+    - PG REVOKE DELETE 权限阻止物理删除
+    - 不在流水表关联合同（不存 contract_id / purpose 字段）
+    - 对账通过 `v_reconciliation` 视图实现：按 (主体 × 对方公司) 汇总
+    - 公司名规范化靠 company_aliases 映射
+
+13. **审计表只允许 INSERT + SELECT**（v0.6 新增）
+    - audit_logs、所有 history 表在 PG 层 REVOKE UPDATE/DELETE
+    - 历史快照永不修改
+    - 软删除自身也要写 history（op_type='soft_delete'）
+
+14. **对话和待办数据保留策略**（v0.6 新增）
+    - conversations / messages 永久保留（至少 2 年内）
+    - pending_issues 自愈机制（问题消失自动 resolved）
+    - tool_call_logs 保留 90 天（Phase 2 定期归档）
+
+---
+
+## 首次建库清单（给 Codex 的第 1 周任务参考）
+
+以下表必须在第 1 周一次性建好（一次 Alembic migration）：
+
+**业务表 + history 表（10 张）**:
+- contracts + contracts_history
+- delivery_orders + delivery_orders_history
+- delivery_delegations + delivery_delegations_history
+- dispatches + dispatches_history
+- transactions + transactions_history
+
+**主数据表（5 张）**:
+- users
+- companies
+- brands
+- products
+- delivery_locations
+
+**别名表（3 张）**:
+- company_aliases
+- brand_aliases
+- product_aliases
+
+**审计三件套（3 张）**:
+- audit_logs
+- change_proposals
+- approval_records
+
+**AI 运行表（4 张）**:
+- conversations
+- messages
+- pending_issues
+- tool_call_logs
+
+**配置表（5 张）**:
+- user_permissions
+- approval_rules
+- audit_rule_configs
+- role_holders
+- leave_records
+
+**视图（5 个）**:
+- v_contracts_with_aggregates
+- v_transactions_normalized
+- v_transaction_balance_by_counterparty
+- v_contract_balance_by_counterparty
+- v_reconciliation
+
+**TRIGGER / 权限 / 扩展**:
+- 扩展：pg_trgm
+- TRIGGER：transactions 表的原始字段保护
+- 权限：app_user 角色 REVOKE DELETE ON transactions
+- 权限：app_user 角色 REVOKE UPDATE, DELETE ON audit_logs
+- 权限：app_user 角色 REVOKE UPDATE, DELETE ON 所有 history 表
+
+**合计约 30 张表 + 5 个视图，一次建好**。后续 Phase 2 再加表时做增量 migration。
+
+---
+
+*v0.6 封顶 - 2026-04-20 全表完整，可交付 Codex 第 1 周建库*
+*v0.5 - 2026-04-20 价格模型锁定 + 调度拆分规则*
+*v0.4 - 2026-04-20 新增应收应付 + 提货链表*
+*v0.3 - 2026-04-20 新增软删除机制*
+*v0.2 - 2026-04-20 基于真实数据 + 业务访谈*
