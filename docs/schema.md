@@ -1,8 +1,8 @@
 # schema.md - 业务表结构定义
 
-> **版本**: v0.8 (品牌/型号/提货地按真实主数据重构 + 提货地变为品牌专属)
+> **版本**: v0.9 (brand_aliases / product_aliases 完整设计 + AI 简称查询逻辑)
 > **状态**: 所有表定稿 ✅ 可直接交付 Codex 第 1 周建库
-> **数据分析样本**: 250 合同 + 64 工单 + 58 委托 + 37 调度 + 713 流水 + 1712 客户档案 + 34 品牌 + 45 型号 + 55 提货地
+> **数据分析样本**: 250 合同 + 64 工单 + 58 委托 + 37 调度 + 713 流水 + 1712 客户档案 + 34 品牌 + 45 型号 + 55 提货地 + 46 品牌简称 + 77 型号简称
 
 ---
 
@@ -20,6 +20,14 @@
 - **所有业务数据一律软删除，严禁物理删除**
 - **合同的数量和单价是真源，不可被下游工单/委托修改**
 - **流水表只读不可改，对账通过视图实现（汇总级对账，不做流水-合同关联）**
+
+**v0.9 改动**（简称表完整设计）:
+- **第 8 节完整改写**：从"（略）"占位变为 brand_aliases / product_aliases 完整设计（约 130 行）
+- **brand_aliases 表**：字段定义 + UNIQUE 约束 + 46 条初始数据来源（`data-import/brand_aliases_final.xlsx`）
+- **product_aliases 表**：字段定义 + 关键设计 `brand_id` 冗余存储 + UNIQUE 约束 + 77 条初始数据来源
+- **新增 8.6 节**：AI 处理简称查询的标准 3 步流程（精确匹配 → 上下文过滤 → fuzzy fallback / 反问）
+- **新增 8.7 节**：简称冲突检测 SQL（运维定期跑）
+- **歧义处理统一为方案乙**：所有歧义简称（数字编码型 + 品类词型）都进表标 `is_ambiguous=true`，AI 看到歧义统一反问品牌
 
 **v0.8 改动**（基于真实 PostgreSQL 主数据重构）:
 - **重构 `delivery_locations` 表**：从全局共享变为**品牌专属**，加 `brand_id` 外键 + 地理字段（`lng`/`lat`/`adcode`/`citycode`）+ `sort_order`
@@ -1266,9 +1274,143 @@ async def validate_contract_location(contract):
 
 ---
 
-## 8. brand_aliases / product_aliases（略）
+## 8. brand_aliases / product_aliases（品牌简称 / 型号简称）
 
-结构同 company_aliases，关联到 brands / products 表。
+### 8.1 设计原则
+
+简称表是 AI 对话系统的核心：业务员说"302"，系统得知道这是"三房巷 CZ302"。简称表用 **(brand_id 或 product_id) + alias** 的关联方式，**不在主表上加字段**——这样一个型号可以挂多个简称，简称查询走索引精确匹配。
+
+**核心规则**：
+- 简称表允许同一 alias 多行（即"歧义"），由 `is_ambiguous` 字段标记
+- AI 看到 `is_ambiguous=true` 或精确查询返回多行时，**强制反问业务员补充上下文**（品牌）
+- 完整型号编码（如 `CZ302`）也作为一条简称入表，AI 不区分"完整名"和"简称"，统一查 aliases
+
+### 8.2 brand_aliases（品牌简称表）
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| id | uuid | Y | 主键 |
+| brand_id | uuid | Y | 正式品牌 ID（FK → brands）|
+| alias | varchar(100) | Y | 简称（如"三房"、"恒力"）|
+| is_ambiguous | boolean | Y | 是否歧义（多品牌共用同一 alias），默认 false |
+| source | enum | Y | `imported` / `manual` / `disambiguation` |
+| confidence | decimal(3,2) | Y | 置信度，默认 1.0 |
+| notes | text | N | 说明（如"行业内对逸盛大化的简称"）|
+| created_at | timestamptz | Y | |
+| created_by | uuid | N | 创建人（FK → users，imported 时为空）|
+
+**约束**：
+- UNIQUE (brand_id, alias) ——同一品牌下同 alias 不重复
+- 不要 UNIQUE (alias) ——允许跨品牌歧义
+
+**初始数据**：46 条已 review 通过的简称（详见 `data-import/brand_aliases_final.xlsx`），全部 `source='imported'`、`is_ambiguous=false`（业务员 review 时已删除所有歧义简称）。
+
+### 8.3 products 表的 UNIQUE 调整说明
+
+> 这里复述 v0.8 第 6 节的关键变更：products 表的 UNIQUE 约束已从 `(model_code)` 改为 `(brand_id, model_code)`。这是 product_aliases 表设计的前提——同一个 `model_code`（如 `CR8816`）可以在多个品牌下存在，所以简称解析必须返回 `(brand_id, product_id)` 二元组才能定位到唯一型号记录。
+
+### 8.4 product_aliases（型号简称表）
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| id | uuid | Y | 主键 |
+| product_id | uuid | Y | 正式型号 ID（FK → products）|
+| brand_id | uuid | Y | 冗余存储，便于查询过滤（FK → brands）|
+| alias | varchar(100) | Y | 简称（如"302"、"大有光"）|
+| is_ambiguous | boolean | Y | 是否歧义（多个 product 共用同一 alias），默认 false |
+| source | enum | Y | `imported` / `manual` / `disambiguation` |
+| confidence | decimal(3,2) | Y | 置信度，默认 1.0 |
+| notes | text | N | 说明（如"15 个品牌共享，必须反问品牌"）|
+| created_at | timestamptz | Y | |
+| created_by | uuid | N | 创建人（FK → users，imported 时为空）|
+
+**约束**：
+- UNIQUE (product_id, alias) ——同一型号下同 alias 不重复
+- **不要 UNIQUE (alias)** ——大有光、水料、油料、8816 等本身就是多 product 共用
+- INDEX (alias) ——简称查询主路径
+- INDEX (brand_id, alias) ——已知品牌时按品牌过滤简称查询
+
+**关键设计：brand_id 冗余存储**
+product_aliases 同时存 `product_id` 和 `brand_id`（虽然 product 已经隐含 brand）。这样 AI 处理对话时常用查询是：
+```sql
+-- 已知品牌 + 简称，定位唯一型号
+SELECT product_id FROM product_aliases
+WHERE brand_id = ? AND alias = ?;
+```
+不用 JOIN products 表，性能更好。
+
+### 8.5 product_aliases 初始数据
+
+来源：`data-import/product_aliases_master.xlsx`，77 条简称。
+
+**生成规则**：
+1. **完整型号编码作为简称**：每个 model_code（CZ302、CR8816、WK-801、YS-W01、PETG）入表
+   - 跨品牌共享的编码（CR8816/CR8863/YS-W01/Y01/C01）：每个品牌一行，标 `is_ambiguous=true`
+2. **纯数字 / 字母简称（业务员口语化）**：
+   - CZ318/302/328/333 → 318/302/328/333 （三房巷唯一，非歧义）
+   - CR8828/8839 → 8828/8839 （华润唯一，非歧义）
+   - **CR8816/8863 → 8816/8863** （华润 + 华润圆粒子共用，标 `is_ambiguous=true`）
+   - WK-801~881 → 801/811/821/851/881 （万凯唯一）+ WK801/WK811/... 去横杠形式
+   - **YS-W01/Y01/C01 → W01/Y01/C01 + YSW01/YSY01/YSC01** （大连/海南逸盛共用，标 `is_ambiguous=true`）
+3. **多品牌共享品类型号名**（强制歧义）：
+   - **大有光**：15 个品牌都有该型号，每个品牌一行，全部 `is_ambiguous=true`
+   - **水料**：4 个品牌（昊源、仪征中石化、汉江、瓶级百宏）都有
+   - **油料**：4 个品牌（昊源、仪征中石化、汉江、瓶级百宏）都有
+
+**统计**：
+- 总行数：77
+- 非歧义简称：28 行
+- 歧义简称（is_ambiguous=true）：49 行
+- 出现多次的 alias key：16 个
+
+### 8.6 AI 处理简称查询的标准逻辑
+
+业务员对话中提到型号时，AI 按以下流程定位：
+
+```
+输入：业务员口语 → 提取型号关键词 keyword
+  
+Step 1: 在 product_aliases 表精确匹配 alias = keyword
+  
+  Case A: 精确匹配 1 条 + is_ambiguous=false
+    → 直接定位 (brand_id, product_id)，无需反问 ✅
+    
+  Case B: 精确匹配多条 OR is_ambiguous=true
+    → 检查对话上下文是否已有品牌 brand_context：
+       ├─ 有 → SQL 加 WHERE brand_id = brand_context 过滤
+       │      ├─ 命中 1 条 → 定位成功 ✅
+       │      └─ 命中 0 条 → 反问"品牌 X 下没有 keyword 这个型号，您是不是说错了？"
+       └─ 无 → 反问"您说的'keyword'是哪个品牌的？候选：A / B / C..."
+    
+  Case C: 精确匹配 0 条
+    → fuzzy match products.model_code（pg_trgm 相似度 > 0.6）
+    → 仍无 → 反问"找不到 keyword 这个型号，您能再说一遍或拼写一下吗？"
+```
+
+**特殊场景：跨简称表查询的优先级**
+当业务员说"开 100 吨大有光"时，"大有光"既可能在 product_aliases 命中 15 条歧义记录，也可能在 brand_aliases 命中（如果未来某品牌起了"大有光"的简称）。AI 优先查 product_aliases（"大有光"在业务语境是型号词），反问用品牌候选列表辅助。
+
+### 8.7 简称冲突检测（运维 SQL）
+
+定期跑这条 SQL 检查简称表健康度：
+
+```sql
+-- 检测 brand_aliases 中是否出现跨品牌同名简称
+SELECT alias, COUNT(DISTINCT brand_id) AS brand_count, ARRAY_AGG(brand_id) AS brand_ids
+FROM brand_aliases
+WHERE deleted_at IS NULL  -- brand_aliases 走软删除
+GROUP BY alias
+HAVING COUNT(DISTINCT brand_id) > 1;
+
+-- 检测 product_aliases 中歧义但未标 is_ambiguous=true 的脏数据
+SELECT alias, COUNT(*) AS cnt, BOOL_OR(is_ambiguous) AS any_marked
+FROM product_aliases
+WHERE deleted_at IS NULL
+GROUP BY alias
+HAVING COUNT(*) > 1 AND BOOL_OR(is_ambiguous) = false;
+```
+
+后者出现非空结果就是 BUG：要么标记缺失，要么数据导入有问题。
 
 ---
 
@@ -2744,6 +2886,7 @@ BUSINESS_SUFFIXES = [
 
 ---
 
+*v0.9 - 2026-04-21 brand_aliases / product_aliases 完整设计 + AI 简称查询逻辑（46 + 77 条简称）*
 *v0.8 - 2026-04-21 品牌/型号/提货地按真实主数据重构 + 提货地变为品牌专属*
 *v0.7 - 2026-04-21 companies 表工商信息扩展 + company_aliases 支持版本化 + 自动生成规则附录*
 *v0.6 - 2026-04-20 全表完整，可交付 Codex 第 1 周建库*
@@ -2765,7 +2908,8 @@ W1 任务 1.3 在 `data-import/` 目录下应有：
 | brands_master.xlsx | 34 | (无外部关联) |
 | products_master.xlsx | 45 | brand_name → brands.formal_name |
 | delivery_locations_master.xlsx | 55 | brand_name → brands.formal_name |
-| brand_aliases_template.xlsx | ~50 | brand_name → brands.formal_name |
+| brand_aliases_final.xlsx | 46 | brand_name → brands.formal_name（已 review）|
+| product_aliases_master.xlsx | 77 | (brand_name, model_code) → products |
 | companies_final.xlsx | 1679 | (无外部关联) |
 | aliases_final.xlsx | 3432 | formal_name → companies.formal_name |
 
@@ -2774,11 +2918,12 @@ W1 任务 1.3 在 `data-import/` 目录下应有：
 必须按以下顺序导入（外键依赖）：
 
 ```
-1. import_brands.py        → brands 表 (34 条)
-2. import_products.py      → products 表 (45 条, 用 brand_name 反查 brand_id)
+1. import_brands.py             → brands 表 (34 条)
+2. import_products.py           → products 表 (45 条, 用 brand_name 反查 brand_id)
 3. import_delivery_locations.py → delivery_locations 表 (55 条, 同上)
-4. import_brand_aliases.py → brand_aliases 表 (业务员 review 完后)
-5. import_companies.py     → companies 表 (1679 条) + 同时导入 company_aliases
+4. import_brand_aliases.py      → brand_aliases 表 (46 条, 已 review)
+5. import_product_aliases.py    → product_aliases 表 (77 条, 用 (brand_name, model_code) 反查 product_id)
+6. import_companies.py          → companies 表 (1679 条) + 同时导入 company_aliases
 ```
 
 ### B.3 关键实现点

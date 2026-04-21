@@ -8,8 +8,8 @@
 >    - 本文件（00-continuation-guide.md）
 >    - 01-project-blueprint.md（项目蓝本）
 >    - 02-development-plan.md（12 周开发计划）
->    - schema.md v0.6（数据库设计）
->    - workflows.md v0.1（工作流定义）
+>    - schema.md v0.9（数据库设计）
+>    - workflows.md v0.2（工作流定义）
 > 3. 告诉新 Claude："先读完这些文档再回答我的问题"
 > 4. 开始提你的新问题
 
@@ -196,7 +196,7 @@
 
 1. ✅ **01-project-blueprint.md**：项目蓝本（架构、设计哲学、子系统设计）
 2. ✅ **02-development-plan.md**：12 周开发计划（每周 codex 任务模板）
-3. ✅ **schema.md v0.8**：数据库 schema（~2840 行，brands/products/delivery_locations 按真实主数据重构）
+3. ✅ **schema.md v0.9**：数据库 schema（~2990 行，brand_aliases / product_aliases 完整设计 + AI 简称查询逻辑）
 4. ✅ **workflows.md v0.2**：12 个核心 workflow 定义（新增 create_company + delete_alias）
 5. ✅ **00-continuation-guide.md**：本文档
 6. ✅ **客户档案清洗成果**（2026-04-21）:
@@ -207,14 +207,17 @@
    - `brands_master.xlsx`：34 个品牌
    - `products_master.xlsx`：45 个型号（按品牌分组）
    - `delivery_locations_master.xlsx`：55 个提货地（**品牌专属**，含经纬度/行政区编码/排序权重）
-   - `brand_aliases_template.xlsx`：业务员 review 用的简称模板
+8. ✅ **简称表**（2026-04-21，已 review）:
+   - `brand_aliases_final.xlsx`：46 条品牌简称（业务员 review 通过，0 冲突）
+   - `product_aliases_master.xlsx`：77 条型号简称（28 非歧义 + 49 歧义；歧义统一标 `is_ambiguous=true`，AI 反问品牌）
+   - `brand_aliases_review_summary.md` / `product_aliases_review_summary.md`：决策记录
 
 ### 待完成文档（⏳）
 
 1. ⏳ **audit-rules.md**：审计规则清单（第 10 周前完成）
 2. ⏳ **queries.md**：日常查询场景清单（第 8 周前完成）
 3. ⏳ **business-defaults.md**：业务默认值规则（第 7 周前完成）
-4. ⏳ **brand_aliases.xlsx / product_aliases.xlsx**：品牌/型号简称（W2 前整理，可参照 companies 的机制）
+4. ⏳ **business 二次 review product_aliases**：确认 WK801/YSW01 这种去横杠简写是否真用（不用就删 8 行），确认是否补充其他口头叫法
 
 ### 开发阶段（当前：第 -1 周，准备期）
 
@@ -226,14 +229,16 @@
 - [x] 确定 6 个业务员的飞书 open_id
 - [x] 客户档案清洗完成
 - [x] 品牌/型号/提货地主数据梳理完成
+- [x] 品牌简称 review 完成（46 条，0 冲突）
+- [x] 型号简称生成完成（77 条，含歧义标记）
 - [ ] Mac 本地 Docker 开发环境搭建
-- [ ] 业务员 review brand_aliases_template.xlsx（约 50 条简称建议确认）
+- [ ] 业务员二次 review product_aliases（确认去横杠简写是否真用）
 - [ ] 工商信息 API 接入方案确定（供 `create_company` workflow 使用）
 
 **第 1 周（项目骨架 + 数据库，未开始）**:
 - 任务 1.1: Python 项目初始化（FastAPI + Docker）
-- 任务 1.2: 数据库 Schema（按 schema.md v0.8 建 30 张表 + 5 个视图）
-- 任务 1.3: 主数据导入（按附录 B 的顺序：brands → products → delivery_locations → brand_aliases → companies + company_aliases）
+- 任务 1.2: 数据库 Schema（按 schema.md v0.9 建 30 张表 + 5 个视图）
+- 任务 1.3: 主数据导入（按附录 B 的顺序：brands → products → delivery_locations → brand_aliases → product_aliases → companies + company_aliases）
 - 任务 1.4: 历史合同/工单/委托/流水数据导入（按 5b 章映射旧品牌名）
 
 **第 2 周到第 12 周**：按开发计划文档推进
@@ -431,14 +436,15 @@ OpenAI Codex 账号: [已配置 / 待配置]
 
 | 文档 | 版本 | 行数 | 状态 |
 |-----|------|------|------|
-| 00-continuation-guide.md | v2.2 | ~440 | ✅ 本文档 |
+| 00-continuation-guide.md | v2.3 | ~445 | ✅ 本文档 |
 | 01-project-blueprint.md | v1.0 | ~1100 | ✅ 稳定 |
 | 02-development-plan.md | v1.0 | ~1400 | ✅ 稳定 |
-| schema.md | v0.8 | ~2840 | ✅ brands/products/delivery_locations 按真实主数据重构 |
+| schema.md | v0.9 | ~2990 | ✅ brand_aliases / product_aliases 完整设计 + AI 简称查询逻辑 |
 | workflows.md | v0.2 | ~1110 | ✅ 新增 create_company + delete_alias |
 
 ---
 
+*v2.3 - 2026-04-21 同步 schema v0.9 + product_aliases 完整设计（77 条简称）*
 *v2.2 - 2026-04-21 同步 schema v0.8 + 品牌/型号/提货地主数据成果*
 *v2.1 - 2026-04-21 补充客户档案清洗成果 + 简称自动生成机制 + create_company workflow*
 *v2.0 - 2026-04-20 完整项目状态快照*
