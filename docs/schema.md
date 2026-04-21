@@ -1,8 +1,8 @@
 # schema.md - 业务表结构定义
 
-> **版本**: v0.7 (companies 表扩展工商信息字段 + company_aliases 支持自动生成与版本化)
+> **版本**: v0.8 (品牌/型号/提货地按真实主数据重构 + 提货地变为品牌专属)
 > **状态**: 所有表定稿 ✅ 可直接交付 Codex 第 1 周建库
-> **数据分析样本**: 250 合同 + 64 工单 + 58 委托 + 37 调度 + 713 流水 + 1712 客户档案
+> **数据分析样本**: 250 合同 + 64 工单 + 58 委托 + 37 调度 + 713 流水 + 1712 客户档案 + 34 品牌 + 45 型号 + 55 提货地
 
 ---
 
@@ -20,6 +20,15 @@
 - **所有业务数据一律软删除，严禁物理删除**
 - **合同的数量和单价是真源，不可被下游工单/委托修改**
 - **流水表只读不可改，对账通过视图实现（汇总级对账，不做流水-合同关联）**
+
+**v0.8 改动**（基于真实 PostgreSQL 主数据重构）:
+- **重构 `delivery_locations` 表**：从全局共享变为**品牌专属**，加 `brand_id` 外键 + 地理字段（`lng`/`lat`/`adcode`/`citycode`）+ `sort_order`
+- **`brands` 表种子数据扩到 34 个品牌**（之前 5.1 节只列了 12 个历史合同里出现的品牌）
+- **`products` 表种子数据 45 个型号**（每个型号挂在具体品牌下；"大有光"、"水料"、"油料"作为通用品类型号在多个品牌下重复存在，业务上合理）
+- **删除 `delivery_locations.name UNIQUE 约束`**：同一地名（如"江阴"）可在多个品牌下各存一条
+- **新增章节 7.5**：业务员说"江阴提"的 AI 处理逻辑（必须在已知品牌上下文内）
+- **新增附录 B**：品牌/型号/提货地的导入流程（用 brand_name 关联 → 运行时生成 uuid）
+- **新增附录 C**：历史合同导入时的品牌名映射（旧名 → 新标准名）
 
 **v0.7 改动**:
 - `companies` 表扩展工商信息字段（法人、注册资本、注册地、经营范围、开户行等）
@@ -998,66 +1007,262 @@ CREATE INDEX idx_company_aliases_alias_trgm
 
 ## 5. brands（品牌表）
 
-| 字段名 | 类型 | 必填 | 含义 |
-|--------|------|------|------|
-| id | uuid | Y | 主键 |
-| formal_name | varchar(100) | Y | 正式品牌名（UNIQUE）|
-| is_active | boolean | Y | 默认 true |
+### 5.1 字段定义
 
-### 5.1 初始数据
+| 字段名 | 类型 | 必填 | 含义 | 约束 |
+|--------|------|------|------|------|
+| id | uuid | Y | 主键 | PK, default gen_random_uuid() |
+| formal_name | varchar(100) | Y | 正式品牌名 | 部分唯一索引（is_active=true 时唯一） |
+| is_active | boolean | Y | 是否激活 | 默认 true |
+| notes | text | N | 备注（如"等业务员补全提货地"等元信息） | |
+| created_at, updated_at, version | | Y | 通用审计字段 | |
 
-| 品牌名 | 合同数 |
-|-------|-------|
-| 三房巷 | 93 |
-| 万凯 | 46 |
-| 大连逸盛 | 21 |
-| 海南逸盛 | 20 |
-| 华润 | 18 |
-| 华润圆粒子 | 12 |
-| 百宏 | 10 |
-| 昊源 | 9 |
-| 仪征 | 9 |
-| 富海 | 8 |
-| 恒力大有光 | 2 |
-| 膜级再生 | 2 |
+### 5.2 索引
+
+```sql
+-- 正式名对活跃品牌唯一
+CREATE UNIQUE INDEX idx_brands_formal_name_active
+  ON brands(formal_name) WHERE is_active = true;
+
+-- 模糊搜索
+CREATE INDEX idx_brands_formal_name_trgm
+  ON brands USING gin(formal_name gin_trgm_ops);
+```
+
+### 5.3 种子数据（34 个品牌，全量）
+
+W1 建库时通过 `import_brands.py` 从 `data-import/brands_master.xlsx` 导入。完整品牌清单见 `data-import/brands_master.xlsx`，分类如下：
+
+**核心活跃品牌（历史合同高频出现）**:
+- 三房巷、万凯、大连逸盛、海南逸盛、华润、华润圆粒子
+- 百宏（细分为"瓶级百宏"和"有光百宏"两个独立品牌）
+- 仪征中石化、富海、昊源
+- 恒力（独立品牌）、进口大有光（独立品牌）、膜级再生
+
+**长尾品牌（合同少或新增）**:
+- 安化、佳宝、宝生、古纤道、三维、远纺、安邦
+- 华润PETG、华宏、盛虹、华亚、恒逸、华逸
+- 汉江、天圣、森楷、国信、乐凯、逸鹏、逸达
+
+**待业务员补全数据的品牌**（13 个无提货地、8 个无型号，已在 `brands_master.xlsx` 的 `notes` 列标注）：
+- 这些品牌允许导入（`is_active=true`），但创建合同时如果没有对应提货地/型号，会有警告
+- 业务员日常使用中遇到时，通过 `create_delivery_location` / `create_product` workflow 补充
+
+### 5.4 数据来源说明
+
+本表的 34 个品牌来源于客户的真实 PostgreSQL 主数据（2026-04-21 导出）。**v0.8 之前的 schema 文档只列了 12 个历史合同里出现过的品牌，是不完整的**——实际业务中有 34 个品牌，部分品牌虽然历史合同少但仍是有效供应商/品牌方。
+
+---
+
+## 5b. 历史品牌名映射（W1 历史合同导入用）
+
+历史 250 条合同里使用的品牌名与新主数据可能不一致，导入时需要映射：
+
+| 历史合同里的品牌名 | 新标准品牌名 | 备注 |
+|-------------------|-------------|------|
+| 百宏 | **瓶级百宏** | 默认映射；如果合同型号是"大有光"则映射到"有光百宏"|
+| 仪征 | **仪征中石化** | |
+| 恒力大有光 | **恒力** | "大有光"作为型号录入到 product_model 字段 |
+| 大连 | **大连逸盛** | 业务员日常简称 |
+| 海南 | **海南逸盛** | 业务员日常简称 |
+| 三房 | **三房巷** | 业务员日常简称 |
+
+**映射逻辑伪码**（W1 导入脚本 `scripts/import_historical_contracts.py` 中实现）:
+```python
+BRAND_NAME_MIGRATION = {
+    "百宏": "瓶级百宏",  # 默认; 见特殊规则
+    "仪征": "仪征中石化",
+    "恒力大有光": "恒力",
+    "大连": "大连逸盛",
+    "海南": "海南逸盛",
+    "三房": "三房巷",
+}
+
+def migrate_brand_name(old_name: str, product_model: str) -> str:
+    # 特殊规则: 百宏 + "大有光"型号 → 有光百宏
+    if old_name == "百宏" and product_model == "大有光":
+        return "有光百宏"
+    return BRAND_NAME_MIGRATION.get(old_name, old_name)
+```
+
+如果历史合同里出现了不在上表的品牌名，导入脚本必须**报错并停止**，由业务员人工处理（不允许悄悄创建新品牌）。
 
 ---
 
 ## 6. products（型号表）
 
+### 6.1 字段定义
+
 | 字段名 | 类型 | 必填 | 含义 |
 |--------|------|------|------|
 | id | uuid | Y | 主键 |
 | brand_id | uuid | Y | 所属品牌（FK → brands）|
-| model | varchar(100) | Y | 型号 |
+| model_code | varchar(100) | Y | 型号编码 |
 | is_active | boolean | Y | 默认 true |
+| notes | text | N | 备注 |
+| created_at, updated_at, version | | Y | 通用审计字段 |
 
-**唯一约束**: (brand_id, model)
+### 6.2 唯一约束
+
+```sql
+-- 同一品牌下型号编码唯一（活跃记录）
+CREATE UNIQUE INDEX idx_products_brand_model_active
+  ON products(brand_id, model_code) WHERE is_active = true;
+
+CREATE INDEX idx_products_brand ON products(brand_id) WHERE is_active = true;
+CREATE INDEX idx_products_model_trgm
+  ON products USING gin(model_code gin_trgm_ops);
+```
+
+**注意**：UNIQUE 是 `(brand_id, model_code)` 的组合，不是 `model_code` 单独唯一。原因是同一型号编码可能在不同品牌下使用：
+- "CR8816" 同时在"华润"和"华润圆粒子"下存在
+- "YS-W01" 同时在"大连逸盛"和"海南逸盛"下存在（同一集团）
+- "大有光"作为通用品类，在 15 个品牌下存在
+- "水料"、"油料"作为通用品类，在 4 个品牌下存在
+
+### 6.3 种子数据（45 个型号）
+
+W1 建库时通过 `import_products.py` 从 `data-import/products_master.xlsx` 导入。完整清单见 xlsx，按品牌分组：
+
+| 品牌 | 型号 |
+|------|------|
+| 三房巷 | CZ302, CZ318, CZ328, CZ333 |
+| 万凯 | WK-801, WK-811, WK-821, WK-851, WK-881 |
+| 大连逸盛 | YS-W01, YS-Y01, YS-C01 |
+| 海南逸盛 | YS-W01, YS-Y01, YS-C01 |
+| 华润 | CR8816, CR8828, CR8839, CR8863 |
+| 华润圆粒子 | CR8816, CR8863 |
+| 仪征中石化 | 水料, 油料 |
+| 昊源 | 水料, 油料 |
+| 汉江 | 水料, 油料 |
+| 瓶级百宏 | 水料, 油料 |
+| 华润PETG | PETG |
+| 通用品类"大有光" | 在 15 个品牌下存在：佳宝、古纤道、恒力、三维、安邦、华宏、盛虹、华亚、恒逸、华逸、有光百宏、天圣、森楷、国信、乐凯 |
+
+### 6.4 关于"大有光" / "水料" / "油料"
+
+这三个是**业内通用品类**，不是具体品牌专属型号。在数据库设计上两种方案：
+
+- **方案 A（已选）**：每个品牌下挂自己的"大有光"/"水料"/"油料"记录，数据冗余但简单
+- 方案 B（未选）：抽出 product_category 字段，型号 = brand + category 组合
+
+选 A 的原因：业务员习惯说"佳宝大有光"、"恒力大有光"，把"大有光"视为型号；改方案会增加业务员适应成本。AI 在反问时如果用户只说"大有光"必须问"哪个品牌的大有光"。
+
+### 6.5 待业务员补全
+
+8 个品牌当前无型号数据：安化、膜级再生、宝生、进口大有光、远纺、富海、逸鹏、逸达。
+
+业务员日常使用中遇到时通过 `create_product` workflow 补充。
 
 ---
 
 ## 7. delivery_locations（提货地表）
 
+### 7.1 重大变更（v0.8）
+
+⚠️ **此表在 v0.8 重构**。之前设计为"全局共享提货地"，现改为"**品牌专属提货地**"——每条记录必须挂在一个品牌下。
+
+**业务原因**：实际数据中，"江阴"这个地名在 7 个品牌下各自存在（三房巷在江阴有 4 个不同仓、华润圆粒子在江阴有 1 个仓、有光百宏 1 个、瓶级百宏 1 个）。它们物理上可能在同一个区域，但**业务上是独立的提货点**：地址不同、仓储方不同、提货流程不同。
+
+业务员说"江阴提"在不知道品牌时是有歧义的，必须先确定品牌。
+
+### 7.2 字段定义
+
 | 字段名 | 类型 | 必填 | 含义 |
 |--------|------|------|------|
 | id | uuid | Y | 主键 |
-| name | varchar(50) | Y | 名称（UNIQUE）|
-| full_address | text | N | 完整地址 |
+| brand_id | uuid | Y | 所属品牌（FK → brands）|
+| location_name | varchar(50) | Y | 业务员日常简称（如"江阴"、"乍浦"）|
+| full_address | text | Y | 完整详细地址 |
+| district | varchar(100) | N | 行政区（如"江苏省无锡市江阴市"）|
+| lng | decimal(10,6) | N | 经度 |
+| lat | decimal(10,6) | N | 纬度 |
+| adcode | varchar(10) | N | 国家行政区编码（如 "320281"）|
+| citycode | varchar(10) | N | 国家城市编码（如 "320200"）|
+| sort_order | int | Y | 排序权重（默认 0；数大的优先显示）|
 | is_active | boolean | Y | 默认 true |
+| notes | text | N | 备注 |
+| created_at, updated_at, version | | Y | 通用审计字段 |
 
-### 7.1 初始数据
+### 7.3 索引与约束
 
-| 名称 | 合同数 |
-|-----|-------|
-| 江阴 | 115 |
-| 海宁 | 46 |
-| 基价仓库 | 41 |
-| 常州 | 18 |
-| 阜阳 | 9 |
-| 仪征 | 9 |
-| 东营 | 8 |
-| 吴江 | 2 |
-| 上海 | 2 |
+```sql
+-- 同一品牌下,(location_name + full_address) 组合唯一
+-- 这样允许同一品牌在同一地名有多个不同地址的仓库
+CREATE UNIQUE INDEX idx_locations_brand_loc_addr_active
+  ON delivery_locations(brand_id, location_name, full_address)
+  WHERE is_active = true;
+
+-- 反查某品牌的所有提货地
+CREATE INDEX idx_locations_brand_active
+  ON delivery_locations(brand_id, sort_order DESC)
+  WHERE is_active = true;
+
+-- 模糊搜索 location_name (业务员说"江阴"时跨品牌搜索)
+CREATE INDEX idx_locations_name_trgm
+  ON delivery_locations USING gin(location_name gin_trgm_ops)
+  WHERE is_active = true;
+```
+
+**注意去掉了 `name UNIQUE`**：v0.7 之前设计为 `name UNIQUE`，会导致只能存一个"江阴"。新设计允许多个"江阴"，但 `(brand_id, location_name, full_address)` 三元组必须唯一（防止同品牌重复录入相同仓库）。
+
+### 7.4 种子数据（55 个提货地）
+
+W1 建库时通过 `import_delivery_locations.py` 从 `data-import/delivery_locations_master.xlsx` 导入。每条记录都关联到具体品牌。
+
+**关键统计**（基于 55 条数据）：
+- 海南逸盛 15 个提货地（最多，全国布局）
+- 大连逸盛 9 个
+- 三房巷 4 个（都在江阴，不同地址）
+- 华润 4 个、万凯 3 个
+- 其他品牌 1-2 个
+- 13 个品牌（佳宝、宝生等）暂无提货地
+
+### 7.5 AI 处理"江阴提"的逻辑（业务规则）
+
+业务员说"江阴提"或"在江阴提货"时，AI 必须按以下逻辑处理：
+
+```
+情况 A: 上下文已确定品牌（如对话中已经说了"三房巷"）
+  → fuzzy_match_location(brand_id=三房巷, query="江阴")
+  → 返回 4 条结果（三房巷在江阴的 4 个仓库）
+  → 按 sort_order 降序展示，让业务员选
+  → 如果 4 条 sort_order 都为 0,反问"具体哪个仓库?"
+  → 如果 1 条 sort_order 明显高于其他,可默认选它,但需展示给业务员确认
+
+情况 B: 上下文未确定品牌
+  → AI 必须先反问品牌
+  → "你说的'江阴提',是哪个品牌？三房巷/华润圆粒子/有光百宏/瓶级百宏 在江阴都有提货地"
+  → 业务员选定品牌后,再走情况 A
+```
+
+**禁止的行为**：
+- ❌ AI 不能自己猜品牌（哪怕只有 1 个品牌在某地有仓也不行）
+- ❌ AI 不能跨品牌返回提货地（例如返回"三房巷江阴 + 华润江阴"让业务员选）
+- ❌ AI 不能默认 sort_order 最高的提货地直接执行写操作（必须让业务员确认）
+
+这个逻辑在 `app/tools/queries/fuzzy_match_location.py` 实现，并在 `business-defaults.md` 中文档化。
+
+### 7.6 contracts.delivery_location_id 的语义变更
+
+之前 `contracts.delivery_location_id` 指向全局提货地。**v0.8 后语义变为指向"品牌专属提货地"**。
+
+强约束：
+```sql
+-- 合同的提货地必须属于合同的品牌
+-- 由应用层在 plan() 阶段校验,不在 DB 层 CHECK 约束(跨表 CHECK 复杂)
+```
+
+应用层伪码：
+```python
+async def validate_contract_location(contract):
+    location = await db.get(DeliveryLocation, contract.delivery_location_id)
+    if location.brand_id != contract.brand_id:
+        raise ValidationError(
+            f"提货地 {location.location_name} 属于品牌 {location.brand.formal_name},"
+            f"不能用于品牌 {contract.brand.formal_name} 的合同"
+        )
+```
 
 ---
 
@@ -2539,9 +2744,102 @@ BUSINESS_SUFFIXES = [
 
 ---
 
+*v0.8 - 2026-04-21 品牌/型号/提货地按真实主数据重构 + 提货地变为品牌专属*
 *v0.7 - 2026-04-21 companies 表工商信息扩展 + company_aliases 支持版本化 + 自动生成规则附录*
 *v0.6 - 2026-04-20 全表完整，可交付 Codex 第 1 周建库*
 *v0.5 - 2026-04-20 价格模型锁定 + 调度拆分规则*
 *v0.4 - 2026-04-20 新增应收应付 + 提货链表*
 *v0.3 - 2026-04-20 新增软删除机制*
 *v0.2 - 2026-04-20 基于真实数据 + 业务访谈*
+
+---
+
+## 附录 B：主数据导入流程（W1 必做）
+
+### B.1 输入文件
+
+W1 任务 1.3 在 `data-import/` 目录下应有：
+
+| 文件 | 行数 | 关联键 |
+|------|------|-------|
+| brands_master.xlsx | 34 | (无外部关联) |
+| products_master.xlsx | 45 | brand_name → brands.formal_name |
+| delivery_locations_master.xlsx | 55 | brand_name → brands.formal_name |
+| brand_aliases_template.xlsx | ~50 | brand_name → brands.formal_name |
+| companies_final.xlsx | 1679 | (无外部关联) |
+| aliases_final.xlsx | 3432 | formal_name → companies.formal_name |
+
+### B.2 导入顺序与脚本
+
+必须按以下顺序导入（外键依赖）：
+
+```
+1. import_brands.py        → brands 表 (34 条)
+2. import_products.py      → products 表 (45 条, 用 brand_name 反查 brand_id)
+3. import_delivery_locations.py → delivery_locations 表 (55 条, 同上)
+4. import_brand_aliases.py → brand_aliases 表 (业务员 review 完后)
+5. import_companies.py     → companies 表 (1679 条) + 同时导入 company_aliases
+```
+
+### B.3 关键实现点
+
+**关于 uuid 生成**：
+
+```python
+# import_brands.py 简化伪码
+brand_name_to_uuid: dict[str, UUID] = {}
+
+for row in xlsx_rows:
+    new_uuid = uuid4()
+    INSERT INTO brands (id=new_uuid, formal_name=row.formal_name, ...)
+    brand_name_to_uuid[row.formal_name] = new_uuid
+
+# 把 mapping 持久化到一个临时文件,供后续 import 脚本用
+save_pickle("brand_name_to_uuid.pkl", brand_name_to_uuid)
+```
+
+```python
+# import_products.py 简化伪码
+brand_name_to_uuid = load_pickle("brand_name_to_uuid.pkl")
+
+for row in xlsx_rows:
+    brand_uuid = brand_name_to_uuid.get(row.brand_name)
+    if not brand_uuid:
+        # 严重错误: brands_master.xlsx 里没有这个品牌
+        raise ImportError(f"品牌 '{row.brand_name}' 不存在,请先在 brands_master.xlsx 中添加")
+    INSERT INTO products (id=uuid4(), brand_id=brand_uuid, model_code=row.model_code, ...)
+```
+
+**容错原则**：
+- 导入脚本必须**事务化**：5 步导入要么全成功要么全回滚
+- 每步前先 SELECT COUNT(*) 检查目标表是否为空（防止重复导入）
+- 如果发现主数据不一致（如 products xlsx 里出现 brands xlsx 没有的品牌名），**报错停止，不允许悄悄创建**
+
+### B.4 导入完成后的验证
+
+```sql
+-- brands 应有 34 条
+SELECT COUNT(*) FROM brands;
+
+-- products 应有 45 条,且每条都能 JOIN 到 brand
+SELECT COUNT(*) FROM products;
+SELECT COUNT(*) FROM products p JOIN brands b ON b.id = p.brand_id;
+-- 两条 SQL 数字必须一致
+
+-- delivery_locations 同理
+SELECT COUNT(*) FROM delivery_locations;
+SELECT COUNT(*) FROM delivery_locations l JOIN brands b ON b.id = l.brand_id;
+
+-- companies 1679 条
+SELECT COUNT(*) FROM companies;
+
+-- company_aliases 3432 条
+SELECT COUNT(*) FROM company_aliases;
+```
+
+---
+
+## 附录 C：历史合同导入的品牌名映射
+
+见 5b 章。导入历史 250 条合同时由 `scripts/import_historical_contracts.py` 处理。
+

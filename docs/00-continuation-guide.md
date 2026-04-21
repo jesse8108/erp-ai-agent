@@ -196,15 +196,18 @@
 
 1. ✅ **01-project-blueprint.md**：项目蓝本（架构、设计哲学、子系统设计）
 2. ✅ **02-development-plan.md**：12 周开发计划（每周 codex 任务模板）
-3. ✅ **schema.md v0.7**：数据库 schema（~2490 行，companies 扩展工商字段）
+3. ✅ **schema.md v0.8**：数据库 schema（~2840 行，brands/products/delivery_locations 按真实主数据重构）
 4. ✅ **workflows.md v0.2**：12 个核心 workflow 定义（新增 create_company + delete_alias）
 5. ✅ **00-continuation-guide.md**：本文档
 6. ✅ **客户档案清洗成果**（2026-04-21）:
-   - `companies.xlsx`：1712 家客户的清洗版本（可直接 W1 导入）
-   - `aliases.xlsx`：3470 条自动生成的简称（可直接 W1 导入）
-   - `duplicates.xlsx`：22 组疑似重复（需人工 review 后合并）
-   - `conflicts.xlsx`：51 个简称冲突（运行期由 AI 反问处理）
-   - `generate_aliases.py` / `detect_duplicates.py`：清洗脚本（可内化为 `app/services/alias_generator.py`）
+   - `companies_final.xlsx`：1679 家客户的清洗版本（W1 直接导入）
+   - `aliases_final.xlsx`：3432 条简称（W1 直接导入）
+   - 历史 22 组重复已合并、11 条垃圾数据已删除、1 条已倒闭已标注
+7. ✅ **品牌/型号/提货地主数据**（2026-04-21，从客户 PostgreSQL 导出）:
+   - `brands_master.xlsx`：34 个品牌
+   - `products_master.xlsx`：45 个型号（按品牌分组）
+   - `delivery_locations_master.xlsx`：55 个提货地（**品牌专属**，含经纬度/行政区编码/排序权重）
+   - `brand_aliases_template.xlsx`：业务员 review 用的简称模板
 
 ### 待完成文档（⏳）
 
@@ -222,15 +225,16 @@
 - [x] 配置 OpenAI Codex + GPT 会员
 - [x] 确定 6 个业务员的飞书 open_id
 - [x] 客户档案清洗完成
+- [x] 品牌/型号/提货地主数据梳理完成
 - [ ] Mac 本地 Docker 开发环境搭建
-- [ ] 业务员 review duplicates.xlsx（22 组疑似重复）
+- [ ] 业务员 review brand_aliases_template.xlsx（约 50 条简称建议确认）
 - [ ] 工商信息 API 接入方案确定（供 `create_company` workflow 使用）
 
 **第 1 周（项目骨架 + 数据库，未开始）**:
 - 任务 1.1: Python 项目初始化（FastAPI + Docker）
-- 任务 1.2: 数据库 Schema（按 schema.md v0.7 建 30 张表 + 5 个视图）
-- 任务 1.3: 客户档案 + 简称批量导入（用 generate_aliases.py 内化后的模块）
-- 任务 1.4: 历史合同/工单/委托/流水数据导入
+- 任务 1.2: 数据库 Schema（按 schema.md v0.8 建 30 张表 + 5 个视图）
+- 任务 1.3: 主数据导入（按附录 B 的顺序：brands → products → delivery_locations → brand_aliases → companies + company_aliases）
+- 任务 1.4: 历史合同/工单/委托/流水数据导入（按 5b 章映射旧品牌名）
 
 **第 2 周到第 12 周**：按开发计划文档推进
 
@@ -427,14 +431,15 @@ OpenAI Codex 账号: [已配置 / 待配置]
 
 | 文档 | 版本 | 行数 | 状态 |
 |-----|------|------|------|
-| 00-continuation-guide.md | v2.1 | ~430 | ✅ 本文档 |
+| 00-continuation-guide.md | v2.2 | ~440 | ✅ 本文档 |
 | 01-project-blueprint.md | v1.0 | ~1100 | ✅ 稳定 |
 | 02-development-plan.md | v1.0 | ~1400 | ✅ 稳定 |
-| schema.md | v0.7 | ~2490 | ✅ companies 扩展工商字段 + company_aliases 版本化 |
+| schema.md | v0.8 | ~2840 | ✅ brands/products/delivery_locations 按真实主数据重构 |
 | workflows.md | v0.2 | ~1110 | ✅ 新增 create_company + delete_alias |
 
 ---
 
+*v2.2 - 2026-04-21 同步 schema v0.8 + 品牌/型号/提货地主数据成果*
 *v2.1 - 2026-04-21 补充客户档案清洗成果 + 简称自动生成机制 + create_company workflow*
 *v2.0 - 2026-04-20 完整项目状态快照*
 *通过这份文档，你随时可以从任何一次对话断点，无缝接回项目。*
