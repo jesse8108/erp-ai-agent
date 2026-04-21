@@ -1,0 +1,41 @@
+# requirements.txt - ERP AI Agent 核心依赖
+#
+# 版本锁定策略：
+# - 主版本号保持稳定（FastAPI 0.x / SQLAlchemy 2.x）
+# - 补丁版本用 ~= 允许自动升级 bugfix
+# - 所有版本号基于 2026-04 时点
+
+# ============ Web 框架 ============
+fastapi~=0.115.0
+uvicorn[standard]~=0.32.0           # standard 含 watchfiles（hot reload）
+pydantic~=2.9.0
+pydantic-settings~=2.6.0            # 从 env 加载配置
+
+# ============ 数据库 ============
+sqlalchemy[asyncio]~=2.0.35
+alembic~=1.13.3
+psycopg[binary,pool]~=3.2.3         # PG 驱动 v3 + 连接池
+# psycopg[binary]: 不需要 libpq-dev 编译（二进制 wheel）
+# psycopg[pool]:   内置连接池 psycopg_pool
+
+# ============ 定时任务 ============
+apscheduler~=3.10.4                 # 触发审计规则、提醒到期等
+
+# ============ Anthropic Claude SDK ============
+anthropic~=0.39.0
+
+# ============ 飞书 SDK ============
+lark-oapi~=1.4.6                    # 飞书官方 Python SDK
+
+# ============ 工具库 ============
+httpx~=0.27.2                       # 异步 HTTP 客户端（飞书、工商 API）
+python-multipart~=0.0.12            # FastAPI 上传文件支持
+python-dateutil~=2.9.0
+pytz~=2024.2
+
+# ============ 开发工具（仅 dev 用）============
+pytest~=8.3.3
+pytest-asyncio~=0.24.0
+pytest-cov~=5.0.0
+ruff~=0.7.0                         # linter + formatter（替代 black+isort+flake8）
+mypy~=1.13.0

@@ -1,0 +1,88 @@
+# docker-compose.yml - ERP AI Agent 开发环境
+#
+# 启动: docker compose up -d
+# 查看日志: docker compose logs -f app
+# 进入 PG: docker compose exec db psql -U erp_dev -d erp_ai
+# 停止: docker compose down
+# 完全清理（含数据）: docker compose down -v
+#
+# Apple Silicon 注意事项:
+# - 使用 platform: linux/arm64 避免 x86 模拟层的性能损耗
+# - pgvector 等扩展暂不需要；当前只用 pg_trgm (PG 16 内置)
+#
+# 网络:
+# - 端口 5432 映射到本机: 方便 DBeaver/TablePlus 连接
+# - 端口 8000 映射到本机: FastAPI 访问入口
+# - 两个服务通过 docker 内部网络通信，app 连 db 用 hostname=db
+
+services:
+  db:
+    image: postgres:16-alpine
+    platform: linux/arm64
+    container_name: erp-ai-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: erp_ai
+      POSTGRES_USER: erp_dev
+      POSTGRES_PASSWORD: erp_dev_local
+      # Apple Silicon 上 C collation 比 en_US 快很多
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      # 命名 volume - Apple Silicon 文件系统大小写不敏感，不用 bind mount
+      - erp_pgdata:/var/lib/postgresql/data
+      # 初始化 SQL 脚本（仅首次启动时执行）
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erp_dev -d erp_ai"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    command:
+      - "postgres"
+      - "-c"
+      - "log_statement=none"            # 开发期不记录每条 SQL，降噪
+      - "-c"
+      - "log_min_duration_statement=500" # 只记录 >500ms 的慢 SQL
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "max_connections=100"
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      platforms:
+        - linux/arm64
+    container_name: erp-ai-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # 直接从 .env 文件加载（见 .env.example）
+      DATABASE_URL: postgresql+psycopg://erp_dev:erp_dev_local@db:5432/erp_ai
+      APP_ENV: development
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"  # print 实时输出
+    ports:
+      - "8000:8000"
+    volumes:
+      # 代码热重载 - 改代码立即生效（uvicorn --reload）
+      - ./app:/code/app:ro
+      - ./alembic:/code/alembic:ro
+      - ./alembic.ini:/code/alembic.ini:ro
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+
+volumes:
+  erp_pgdata:
+    name: erp_ai_pgdata

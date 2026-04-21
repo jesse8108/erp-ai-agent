@@ -1,0 +1,105 @@
+# pyproject.toml - ERP AI Agent 项目元数据 + 工具配置
+
+[project]
+name = "erp-ai-agent"
+version = "0.1.0"
+description = "ERP 业务管理 AI 对话系统"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+
+# ============================================================
+# Ruff - linter + formatter（一个工具替代 black/isort/flake8）
+# ============================================================
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "tests"]
+extend-exclude = [
+    "alembic/versions",     # 自动生成的 migration 不管
+]
+
+[tool.ruff.lint]
+# 启用规则集（精选实用的，避免过度限制）
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # bugbear（反模式检测）
+    "C4",   # comprehensions
+    "UP",   # pyupgrade（用新语法）
+    "SIM",  # simplify
+    "PTH",  # pathlib（强制用 Path 而非 os.path）
+    "RUF",  # ruff 自身的额外规则
+]
+ignore = [
+    "E501",   # line too long（让 formatter 处理）
+    "B008",   # FastAPI 的 Depends(func()) 会被误报
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B018"]          # 测试里允许一些"无效"表达式（断言）
+"app/db/models/*" = ["RUF012"]  # ORM model 的 mutable class attrs 是正常的
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# ============================================================
+# Mypy - 类型检查
+# ============================================================
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+
+# 第三方库类型存根缺失时不报错
+[[tool.mypy.overrides]]
+module = [
+    "lark_oapi.*",
+    "apscheduler.*",
+]
+ignore_missing_imports = true
+
+# Alembic 自动生成的文件不检查
+[[tool.mypy.overrides]]
+module = "alembic.versions.*"
+ignore_errors = true
+
+# ============================================================
+# Pytest
+# ============================================================
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"         # 异步测试自动识别
+addopts = [
+    "-ra",                     # 显示所有非成功测试的原因
+    "--strict-markers",
+    "--tb=short",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+    "*/alembic/*",
+    "*/tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
