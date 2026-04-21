@@ -196,31 +196,41 @@
 
 1. ✅ **01-project-blueprint.md**：项目蓝本（架构、设计哲学、子系统设计）
 2. ✅ **02-development-plan.md**：12 周开发计划（每周 codex 任务模板）
-3. ✅ **schema.md v0.6**：数据库 schema（2258 行，所有表 + 视图 + TRIGGER）
-4. ✅ **workflows.md v0.1**：10 个核心 workflow 定义（876 行）
+3. ✅ **schema.md v0.7**：数据库 schema（~2490 行，companies 扩展工商字段）
+4. ✅ **workflows.md v0.2**：12 个核心 workflow 定义（新增 create_company + delete_alias）
 5. ✅ **00-continuation-guide.md**：本文档
+6. ✅ **客户档案清洗成果**（2026-04-21）:
+   - `companies.xlsx`：1712 家客户的清洗版本（可直接 W1 导入）
+   - `aliases.xlsx`：3470 条自动生成的简称（可直接 W1 导入）
+   - `duplicates.xlsx`：22 组疑似重复（需人工 review 后合并）
+   - `conflicts.xlsx`：51 个简称冲突（运行期由 AI 反问处理）
+   - `generate_aliases.py` / `detect_duplicates.py`：清洗脚本（可内化为 `app/services/alias_generator.py`）
 
 ### 待完成文档（⏳）
 
-1. ⏳ **aliases.xlsx**：公司/品牌/型号简称表（需组织业务员 1 小时会议整理）
-2. ⏳ **audit-rules.md**：审计规则清单（第 10 周前完成）
-3. ⏳ **queries.md**：日常查询场景清单（第 8 周前完成）
-4. ⏳ **business-defaults.md**：业务默认值规则（第 7 周前完成）
+1. ⏳ **audit-rules.md**：审计规则清单（第 10 周前完成）
+2. ⏳ **queries.md**：日常查询场景清单（第 8 周前完成）
+3. ⏳ **business-defaults.md**：业务默认值规则（第 7 周前完成）
+4. ⏳ **brand_aliases.xlsx / product_aliases.xlsx**：品牌/型号简称（W2 前整理，可参照 companies 的机制）
 
 ### 开发阶段（当前：第 -1 周，准备期）
 
-**第 0 周（准备工作，未开始）**:
-- [ ] 购买云服务器（主机 + 备机 4C8G Ubuntu 22.04）
-- [ ] 申请飞书自建应用，获取 App ID / App Secret
-- [ ] 创建 GitHub 私有仓库
-- [ ] 配置 OpenAI Codex + GPT 会员
-- [ ] 整理 aliases.xlsx（50 个客户 + 全品牌 + 主要型号）
-- [ ] 确定 6 个业务员的飞书 open_id
+**第 0 周（准备工作，进行中）**:
+- [x] 购买云服务器
+- [x] 申请飞书自建应用
+- [x] 创建 GitHub 私有仓库
+- [x] 配置 OpenAI Codex + GPT 会员
+- [x] 确定 6 个业务员的飞书 open_id
+- [x] 客户档案清洗完成
+- [ ] Mac 本地 Docker 开发环境搭建
+- [ ] 业务员 review duplicates.xlsx（22 组疑似重复）
+- [ ] 工商信息 API 接入方案确定（供 `create_company` workflow 使用）
 
 **第 1 周（项目骨架 + 数据库，未开始）**:
 - 任务 1.1: Python 项目初始化（FastAPI + Docker）
-- 任务 1.2: 数据库 Schema（按 schema.md v0.6 建 30 张表 + 5 个视图）
-- 任务 1.3: 历史数据导入
+- 任务 1.2: 数据库 Schema（按 schema.md v0.7 建 30 张表 + 5 个视图）
+- 任务 1.3: 客户档案 + 简称批量导入（用 generate_aliases.py 内化后的模块）
+- 任务 1.4: 历史合同/工单/委托/流水数据导入
 
 **第 2 周到第 12 周**：按开发计划文档推进
 
@@ -417,13 +427,14 @@ OpenAI Codex 账号: [已配置 / 待配置]
 
 | 文档 | 版本 | 行数 | 状态 |
 |-----|------|------|------|
-| 00-continuation-guide.md | v2.0 | ~400 | ✅ 本文档 |
+| 00-continuation-guide.md | v2.1 | ~430 | ✅ 本文档 |
 | 01-project-blueprint.md | v1.0 | ~1100 | ✅ 稳定 |
 | 02-development-plan.md | v1.0 | ~1400 | ✅ 稳定 |
-| schema.md | v0.6 | ~2260 | ✅ 封顶 |
-| workflows.md | v0.1 | ~880 | ✅ 首版，开发时迭代 |
+| schema.md | v0.7 | ~2490 | ✅ companies 扩展工商字段 + company_aliases 版本化 |
+| workflows.md | v0.2 | ~1110 | ✅ 新增 create_company + delete_alias |
 
 ---
 
+*v2.1 - 2026-04-21 补充客户档案清洗成果 + 简称自动生成机制 + create_company workflow*
 *v2.0 - 2026-04-20 完整项目状态快照*
 *通过这份文档，你随时可以从任何一次对话断点，无缝接回项目。*

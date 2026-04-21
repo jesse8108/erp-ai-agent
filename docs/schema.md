@@ -1,8 +1,8 @@
 # schema.md - 业务表结构定义
 
-> **版本**: v0.6 (全表封顶：流水 + 审计 + AI 运行表完整)
+> **版本**: v0.7 (companies 表扩展工商信息字段 + company_aliases 支持自动生成与版本化)
 > **状态**: 所有表定稿 ✅ 可直接交付 Codex 第 1 周建库
-> **数据分析样本**: 250 合同 + 64 工单 + 58 委托 + 37 调度 + 713 流水
+> **数据分析样本**: 250 合同 + 64 工单 + 58 委托 + 37 调度 + 713 流水 + 1712 客户档案
 
 ---
 
@@ -20,6 +20,15 @@
 - **所有业务数据一律软删除，严禁物理删除**
 - **合同的数量和单价是真源，不可被下游工单/委托修改**
 - **流水表只读不可改，对账通过视图实现（汇总级对账，不做流水-合同关联）**
+
+**v0.7 改动**:
+- `companies` 表扩展工商信息字段（法人、注册资本、注册地、经营范围、开户行等）
+- `companies` 表新增 `external_code`（历史档案编号）、`legal_person`、`registered_address` 等字段
+- `company_aliases` 表 `source` 枚举新增 `auto_generated` 值
+- `company_aliases` 表新增 `generator_version` 字段（记录生成算法版本，便于批量重算）
+- `company_aliases` 表加入软删除字段（业务员可删除误生成的简称）
+- 新增"公司工商信息获取 API"的集成说明
+- 新增"简称自动生成规则"的完整描述（见附录 A）
 
 **v0.6 改动**:
 - 流水表（transactions）完整定稿：只读、不关联合同、3 重保护
@@ -800,36 +809,190 @@ CREATE UNIQUE INDEX idx_users_feishu_active
 
 ### 3.2 字段定义
 
+#### 3.2.1 标识字段
+
+| 字段名 | 类型 | 必填 | 含义 | 约束 |
+|--------|------|------|------|------|
+| id | uuid | Y | 主键 | PK, default gen_random_uuid() |
+| formal_name | varchar(200) | Y | 正式全名 | 部分唯一索引（见 3.4）|
+| external_code | varchar(50) | N | 原档案编号（从飞书档案继承，如 `22E3ND0F68555E2` 或 `C-260417-001`）| |
+| tax_id | varchar(30) | N | 统一社会信用代码（18 位）| 见 3.3 |
+
+#### 3.2.2 业务分类
+
 | 字段名 | 类型 | 必填 | 含义 |
 |--------|------|------|------|
-| id | uuid | Y | 主键 |
-| formal_name | varchar(200) | Y | 正式名（UNIQUE） |
-| company_type | enum | N | `customer` / `supplier` / `both` |
-| tax_id | varchar(30) | N | 税号 |
-| is_active | boolean | Y | 是否激活 |
-| notes | text | N | 备注 |
+| company_type | enum | N | `customer`（客户）/ `supplier`（供应商）/ `both`（既买又卖）|
+| business_relation_type | varchar(30) | N | 细分业务关系：`贸易商` / `下游工厂` / `一般客户` / `上游厂家` / `撮合对方` 等（保留原档案的细分标签）|
 
-### 3.3 说明
+**company_type 与 business_relation_type 的关系**：
+- `company_type` 是系统级分类，用于工具权限和查询过滤
+- `business_relation_type` 是业务语义标签，保留原档案的细粒度信息，不参与权限判断
+- 一般映射：贸易商 → `both`、下游工厂 → `customer`、上游厂家 → `supplier`、一般客户 → `customer`
+- 映射规则可在导入时配置，也允许业务员人工调整
+
+#### 3.2.3 工商信息字段（新增于 v0.7）
+
+这些字段由**工商信息 API**（发起人后续接入）或人工录入填充。AI 不应要求业务员手动填这些字段，而是：
+- 业务员只提供"公司名称"
+- `create_company` workflow 调用工商 API 查询详情
+- 查询成功 → 自动填充；查询失败 → 只保留 formal_name，其他字段留空
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| legal_person | varchar(50) | N | 法定代表人 |
+| registered_capital | varchar(50) | N | 注册资本（保留原文，如 "500万人民币"）|
+| paid_in_capital | varchar(50) | N | 实缴资本 |
+| business_status | varchar(30) | N | 经营状态：`存续` / `在营` / `注销` / `吊销` / `停业` 等（原文保留）|
+| enterprise_type | varchar(100) | N | 企业类型（如"有限责任公司（自然人独资）"）|
+| registered_address | text | N | 注册地址（原文保留，可能是 JSON 结构或纯文本）|
+| established_date | date | N | 成立日期 |
+| business_expire_date | date | N | 营业有效期截止日期 |
+| business_scope | text | N | 经营范围（原文，通常很长）|
+| bank_name | varchar(200) | N | 开户行 |
+| bank_account | varchar(50) | N | 银行账号 |
+
+**说明**：
+- 工商 API 返回的字段全部是可选的（API 可能查不到或信息不全）
+- 这些字段 AI 通常不会主动展示给业务员，除非业务员问"XX 公司的详细信息"
+- `business_scope` 字段内容通常很长（几百到几千字），查询时按需返回
+
+#### 3.2.4 状态与审计字段
+
+| 字段名 | 类型 | 必填 | 含义 |
+|--------|------|------|------|
+| is_active | boolean | Y | 是否激活，默认 true；注销/吊销的公司历史合同依然引用但不允许新建 |
+| notes | text | N | 备注（自由文本）|
+| created_by | uuid | Y | 创建人（FK → users）|
+| created_at | timestamptz | Y | 创建时间 |
+| updated_by | uuid | Y | 最后更新人 |
+| updated_at | timestamptz | Y | 最后更新时间 |
+| version | int | Y | 乐观锁，默认 1 |
+
+**说明**：
+- `companies` 是**主数据表**，不用 `deleted_at` 软删除，用 `is_active`（见 0.5.4）
+- 历史合同引用的公司即使 `is_active=false` 也必须能正常查询显示
+
+### 3.3 tax_id（统一社会信用代码）的处理
+
+**格式**：18 位大写字母和数字组合，如 `91330782MA2EEHAU50`
+
+**约束**：
+- 不强制唯一（允许 NULL）——历史数据中部分公司无税号
+- 但**有值时必须唯一**（见 3.4 部分唯一索引）
+- 作为重复检测的最强信号（`create_company` workflow 会优先用 tax_id 查重）
+
+**导入策略**：
+- 档案里没有税号的记录直接导入（NULL）
+- 之后如果调工商 API 补齐了 tax_id，更新即可
+- 两条 tax_id 相同的记录是明确的重复（见 `detect_duplicates.py` 规则）
+
+### 3.4 索引与约束
+
+```sql
+-- 正式名：对活跃公司唯一
+CREATE UNIQUE INDEX idx_companies_formal_name_active
+  ON companies(formal_name) WHERE is_active = true;
+
+-- 税号：有值时唯一（不包含 NULL）
+CREATE UNIQUE INDEX idx_companies_tax_id
+  ON companies(tax_id) WHERE tax_id IS NOT NULL;
+
+-- 模糊搜索（pg_trgm）
+CREATE INDEX idx_companies_formal_name_trgm
+  ON companies USING gin(formal_name gin_trgm_ops);
+
+-- 业务查询常用
+CREATE INDEX idx_companies_type ON companies(company_type) WHERE is_active = true;
+CREATE INDEX idx_companies_active ON companies(is_active);
+```
+
+### 3.5 说明
 
 - **软关联**: contracts 表不强制要求每个甲方/乙方都在此表注册
 - 此表作为逐步规范化的目标，Phase 2 逐步推进
+- **新增公司走 `create_company` workflow**（见 workflows.md 11 节），不允许直接 INSERT
 
 ---
 
 ## 4. company_aliases（公司简称表）
 
-支持"美远 → 美远贸易有限公司"这类映射。
+支持"美远 → 美远贸易有限公司"这类映射。**简称既有系统自动生成的，也有业务员手工维护的，还有 AI 从对话中学习的。**
+
+### 4.1 字段定义
 
 | 字段名 | 类型 | 必填 | 含义 |
 |--------|------|------|------|
 | id | uuid | Y | 主键 |
 | company_id | uuid | Y | 正式公司 ID（FK → companies）|
-| alias | varchar(100) | Y | 简称 |
-| alias_type | enum | Y | `common` / `user_specific` |
+| alias | varchar(100) | Y | 简称文本 |
+| alias_type | enum | Y | `common`（全局通用）/ `user_specific`（仅某用户有效）|
 | specific_user_id | uuid | N | 特定用户（user_specific 类型必填）|
-| confidence | decimal(3,2) | Y | 置信度，默认 1.0 |
-| source | enum | Y | `manual` / `disambiguation` / `promoted` |
+| confidence | decimal(3,2) | Y | 置信度（0-1.0），默认 1.0 |
+| source | enum | Y | 来源（见 4.2）|
+| generator_version | varchar(10) | N | 自动生成算法版本号（如 `v1.0`）；source=auto_generated 时必填 |
 | created_at | timestamptz | Y | |
+| created_by | uuid | N | 创建者（手工创建时必填；系统自动生成时为 NULL）|
+| deleted_at | timestamptz | N | 软删除时间（NULL = 未删除）|
+| deleted_by | uuid | N | 软删除执行人 |
+| deleted_reason | text | N | 删除原因 |
+
+### 4.2 source 枚举值（v0.7 扩展）
+
+| source 值 | 含义 | 时机 | 典型数量 |
+|----------|------|------|---------|
+| `auto_generated` | 系统根据全名自动生成 | 创建公司时（`generate_aliases` 函数）| 每公司 2-3 个 |
+| `manual` | 业务员手工追加 | 创建公司时 / 后续维护 | 每公司 0-3 个 |
+| `disambiguation` | AI 反问后业务员选择的结果自动沉淀 | 运行期对话中 | 初期少，运行后累积 |
+| `promoted` | `disambiguation` 类被多次使用后升格为通用 | 定时任务（Phase 2）| Phase 2 |
+| `imported` | 从历史系统/xlsx 批量导入 | W1 建库时一次性 | 首次导入使用 |
+
+**规则**：
+- 所有简称无论来源，**查询匹配时同等对待**（不因来源不同而降权）
+- `confidence` 字段可为不同来源设不同默认值：auto_generated=0.9、manual=1.0、disambiguation=0.85、promoted=0.95
+- 业务员可以删除任何 source 的简称（走 `delete_alias` workflow，软删除）
+- 误删可通过"恢复"workflow 找回
+
+### 4.3 约束
+
+- **(company_id, alias, alias_type, specific_user_id) 对活跃记录唯一**
+  ```sql
+  CREATE UNIQUE INDEX idx_company_aliases_unique_active
+    ON company_aliases(company_id, alias, alias_type, COALESCE(specific_user_id, '00000000-0000-0000-0000-000000000000'::uuid))
+    WHERE deleted_at IS NULL;
+  ```
+- `alias_type = 'user_specific'` 时 `specific_user_id` 必填，否则必空
+- `source = 'auto_generated'` 时 `generator_version` 必填，`created_by` 可空
+- `source = 'manual'` 时 `created_by` 必填
+- `deleted_at IS NOT NULL` 时 `deleted_by`、`deleted_reason` 必填
+
+### 4.4 索引
+
+```sql
+-- 精确匹配（最高频）
+CREATE INDEX idx_company_aliases_alias
+  ON company_aliases(alias)
+  WHERE deleted_at IS NULL;
+
+-- 反查某公司的所有简称
+CREATE INDEX idx_company_aliases_company
+  ON company_aliases(company_id)
+  WHERE deleted_at IS NULL;
+
+-- user_specific 快速匹配
+CREATE INDEX idx_company_aliases_user_specific
+  ON company_aliases(specific_user_id, alias)
+  WHERE deleted_at IS NULL AND alias_type = 'user_specific';
+
+-- 模糊匹配兜底（pg_trgm）
+CREATE INDEX idx_company_aliases_alias_trgm
+  ON company_aliases USING gin(alias gin_trgm_ops)
+  WHERE deleted_at IS NULL;
+```
+
+### 4.5 生成逻辑见附录 A
+
+完整的简称自动生成规则（剥除后缀、地理前缀识别、业务后缀反复剥离等）详见文档末尾附录 A。
 
 ---
 
@@ -2251,7 +2414,133 @@ REVOKE DELETE ON contracts FROM app_user;
 
 ---
 
-*v0.6 封顶 - 2026-04-20 全表完整，可交付 Codex 第 1 周建库*
+## 附录 A：公司简称自动生成规则（v1.0）
+
+本附录定义 `generate_aliases(formal_name: str) -> list[str]` 函数的完整规则。此函数实现在 `app/services/alias_generator.py`，**同时被**以下场景调用：
+
+1. **W1 批量导入**：`scripts/import_companies.py` 把 1712 家历史客户一次性生成简称
+2. **`create_company` workflow**：新增公司时自动生成建议简称
+3. **Phase 2 重算任务**：算法升级后可按 `generator_version` 批量重新生成
+
+### A.1 生成策略（3 层剥离）
+
+输入全名 `formal_name`，输出简称列表（通常 2-3 个）。
+
+**Step 0：去括号**
+
+```
+"涂多多（青岛）跨境电子商务有限公司" → "涂多多跨境电子商务有限公司"
+```
+
+用正则 `[（(][^）)]*[）)]` 剔除所有全/半角括号及其内容。
+
+**Step 1：剥除公司性质后缀**
+
+按最长匹配，反复剥除以下后缀（最多 3 轮）：
+
+```python
+SUFFIXES = [
+    "股份有限公司", "有限责任公司", "有限公司", "股份公司",
+    "集团有限公司", "集团公司", "集团",
+    "合伙企业", "普通合伙", "有限合伙",
+    "个人独资企业", "个体工商户",
+    "分公司", "办事处",
+]
+```
+
+得到"核心名"：
+```
+"涂多多跨境电子商务有限公司" → "涂多多跨境电子商务"
+"张家港辉凡新材料科技有限公司" → "张家港辉凡新材料科技"
+```
+
+**Step 2：剥离地理前缀**
+
+识别省级+地级市前缀，得到"无地理核心名"和"地理前缀"。支持形式：
+- `浙江XX` / `浙江省XX`
+- `张家港XX` / `张家港市XX`
+- `浙江义乌XX` / `浙江省义乌市XX`
+
+完整词典见 `app/services/alias_generator.py`（包含 31 省 + 约 200 地级市）。
+
+```
+"张家港辉凡新材料科技" → 核心名="辉凡新材料科技"，地理前缀="张家港"
+```
+
+**Step 3：反复剥除业务类型后缀**
+
+按最长匹配，反复剥除以下后缀（最多 3 轮，但不剥到 <2 字）：
+
+```python
+BUSINESS_SUFFIXES = [
+    "科技", "实业", "贸易", "商贸", "工贸", "发展",
+    "塑业", "塑胶", "塑化", "新材料", "材料", "化工",
+    "包装", "制品", "饰品", "玩具", "食品", "饮品",
+    "橡塑", "印务", "印刷", "建材",
+    "进出口", "国际贸易", "国际",
+    "投资", "企业管理", "管理",
+]
+```
+
+得到两个版本：
+- `shortest`：反复剥除后的最短核心（如"辉凡"）
+- `mid`：只剥一次后的中间形态（如"辉凡新材料"）
+
+### A.2 生成候选简称
+
+从上述产物组合生成候选，去重后返回：
+
+| 候选名 | 例子（对 "张家港辉凡新材料科技有限公司"）|
+|-------|----------------------------------------|
+| `shortest` | 辉凡 |
+| `mid`（若与 shortest 不同）| 辉凡新材料 |
+| 地理前缀 + shortest | 张家港辉凡 |
+
+### A.3 过滤规则
+
+以下情况不产出简称：
+- 简称长度 < 2 字
+- 简称 == formal_name
+- 简称 == 去括号后的全名（避免只剥括号的无效简称）
+
+### A.4 异常检测
+
+以下情况标记为"异常"，不生成简称并记录到人工 review 清单：
+- 全名为空
+- 剥除公司性质后缀后核心 ≤ 3 字（可能是个人名或不规范录入）
+- `XX厂`、`XX百货店`、`XX商行` 等非公司实体（词典外的后缀暂不覆盖，会不生成简称）
+
+### A.5 冲突检测
+
+生成后检测：同一个简称被**多家公司**指向。这些冲突**不需要阻止**，由运行期 AI 反问处理。但要记录到 `conflicts.xlsx` 供人工 review（例如"国贸"对应多家，可能需要业务员人工删除某些误生成的）。
+
+### A.6 算法版本化
+
+`generator_version` 字段跟踪用的是哪一版规则生成的。当前版本 `v1.0`。
+
+升级规则时步骤：
+1. 在 `alias_generator.py` 新增 `generate_aliases_v2()`，`version="v1.1"`
+2. 测试验证新规则输出更好
+3. 运行定时任务 `rebuild_aliases`：把 `source='auto_generated' AND generator_version < 'v1.1'` 的简称全部软删除，重新生成
+4. 业务员手工维护的（source=manual/disambiguation）**不动**
+
+### A.7 实测数据（v1.0 在 1712 家公司上）
+
+| 指标 | 数值 |
+|------|------|
+| 公司总数 | 1712 |
+| 成功生成简称 | 1667（97.4%）|
+| 简称总数 | 约 3500 |
+| 平均每公司简称数 | 2.0 |
+| 简称冲突组 | 51 组（需 AI 反问处理）|
+| 疑似重复公司组 | 22 组（待人工合并）|
+
+详细统计见 `/docs/aliases-review.md`。
+
+---
+
+*v0.7 - 2026-04-21 companies 表工商信息扩展 + company_aliases 支持版本化 + 自动生成规则附录*
+*v0.6 - 2026-04-20 全表完整，可交付 Codex 第 1 周建库*
 *v0.5 - 2026-04-20 价格模型锁定 + 调度拆分规则*
 *v0.4 - 2026-04-20 新增应收应付 + 提货链表*
 *v0.3 - 2026-04-20 新增软删除机制*

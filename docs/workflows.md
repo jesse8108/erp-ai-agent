@@ -1,8 +1,8 @@
 # workflows.md - Workflow 定义文档
 
-> **版本**: v0.1（第一版，10 个核心 workflow）
+> **版本**: v0.2（新增 create_company / delete_alias；明确简称自动生成规则）
 > **状态**: 结构完整，细节可在开发时迭代
-> **配套文档**: schema.md v0.6、01-project-blueprint.md、02-development-plan.md
+> **配套文档**: schema.md v0.7、01-project-blueprint.md、02-development-plan.md
 
 ---
 
@@ -53,7 +53,7 @@ ProposalExecutor.execute(plan)
 飞书卡片回显结果
 ```
 
-### 10 个核心 Workflow 清单
+### 12 个核心 Workflow 清单（v0.2）
 
 | # | Workflow 名 | 用途 | 估复杂度 | 开发周次 |
 |---|------------|------|---------|---------|
@@ -66,7 +66,9 @@ ProposalExecutor.execute(plan)
 | 7 | soft_delete_contract | 逻辑删除合同 | 中 | W8 |
 | 8 | create_delivery_order | 新建提货工单 | 中 | W9 |
 | 9 | create_delivery_delegation | 新建提货委托 | 中 | W9 |
-| 10 | create_dispatch | 新建车辆调度（含拆分） | 中 | W9 |
+| 10 | create_dispatch | 新建车辆调度（含拆分）| 中 | W9 |
+| **11** | **create_company** | **新增供应商/客户（含简称自动生成）** | **中** | **W2** |
+| **12** | **delete_alias** | **删除公司简称** | **低** | **W2** |
 
 ### Phase 2 待做的 Workflow
 
@@ -76,6 +78,8 @@ ProposalExecutor.execute(plan)
 - `update_delivery_order` / `cancel_delivery_order`
 - `update_dispatch` / `cancel_dispatch`
 - `auto_reconcile_transactions` - 自动对账
+- `merge_duplicate_companies` - 合并疑似重复公司
+- `promote_alias` - 把 disambiguation 类简称升格为 common
 
 ---
 
@@ -859,6 +863,8 @@ AI 生成的 Plan 预览文本范例。
 | create_delivery_order | ≥ 50 万 | 一级 | 部门主管 |
 | create_delivery_delegation | 无 | 无 | - |
 | create_dispatch | 无 | 无 | - |
+| **create_company** | **无** | **无** | **-（业务员自助）** |
+| **delete_alias** | **无** | **无** | **-（业务员自助）** |
 
 金额阈值具体数字可在 `approval_rules` 表配置。
 
@@ -866,11 +872,273 @@ AI 生成的 Plan 预览文本范例。
 
 ## 附录 C: Workflow 实现顺序（配合 12 周计划）
 
+- **W2**：**create_company + delete_alias**（配合模糊匹配 + import_companies 批量导入）
 - **W3**：create_sales_contract + update_contract_quantity（打通 Plan 生成和执行）
 - **W8**：create_purchase_contract + create_brokering_contract + update_contract_price + cancel_contract + soft_delete_contract
 - **W9**：create_delivery_order + create_delivery_delegation + create_dispatch
 
 ---
 
+## 11. create_company（新增供应商/客户）
+
+### 用途
+
+业务员建合同时发现客户/供应商不在档案里，通过 AI 添加。核心价值是：
+1. 通过工商信息 API **自动获取**公司详情（免人工填写）
+2. 通过 `generate_aliases()` **自动生成**简称（免人工整理）
+3. **主动检测重复**（通过税号 + 名称相似度），避免脏数据重复录入
+
+### 触发场景
+
+**显式触发**:
+- "加个新客户，浙江塑界新材料有限公司"
+- "注册一下供应商：台州市黄岩绿鼎红贸易有限公司"
+
+**隐式触发**（建合同时系统主动提示）:
+- 业务员："给义乌晓珍建个销售合同"
+- AI 模糊匹配 → 未找到 → "档案里没有'义乌晓珍'，要先添加吗？"
+- 业务员："好"
+- → 进入 `create_company` 子流程，完成后自动回到 `create_sales_contract`
+
+### 输入参数
+
+**业务员必须提供**:
+| 参数 | 类型 | 说明 |
+|-----|------|------|
+| formal_name | string | 公司正式全名（至少 4 字）|
+
+**业务员可选提供**:
+| 参数 | 类型 | 说明 |
+|-----|------|------|
+| company_type | enum | customer/supplier/both；不填则 AI 反问 |
+| business_relation_type | string | 业务关系细分（贸易商/下游工厂等）；不填则默认空 |
+| extra_aliases | list[string] | 业务员追加的简称（在自动生成基础上追加）|
+| notes | text | 备注 |
+
+**系统自动获取**（通过工商信息 API）:
+- `tax_id` / `legal_person` / `registered_capital` / `paid_in_capital`
+- `business_status` / `enterprise_type` / `registered_address`
+- `established_date` / `business_expire_date` / `business_scope`
+- `bank_name` / `bank_account`
+
+**系统自动生成**:
+- `auto_aliases`：调用 `generate_aliases(formal_name)` 得到
+- `is_active = true`
+- `created_by = 当前用户`
+
+### 前置条件
+
+1. 业务员有 `create_company` 权限
+2. `formal_name` 长度 ≥ 4（防止"董总"、"徐正"这类脏数据）
+3. `formal_name` 不等于任何"脏数据黑名单"（可维护，初始包含"损毁单位"等）
+
+### 业务规则校验
+
+**硬规则（error）**:
+- `formal_name` 长度 ≥ 4
+- `formal_name` 经过归一化（去空格、去括号、全角转半角）后不为空
+
+**重复检测**（硬规则，error，阻塞）:
+
+**Step 1：税号查重**
+- 如果工商 API 成功返回 `tax_id` → 查 `companies.tax_id`
+- 命中 → 直接拒绝："税号 {tax_id} 已存在，对应公司: {formal_name}。无需重复添加。"
+
+**Step 2：名称查重（归一化）**
+- 把输入的 `formal_name` 和数据库所有 `companies.formal_name` 都做归一化：
+  - 全角括号 → 半角
+  - 去除所有括号内容
+  - 去除空格
+- 命中完全相同 → 拒绝并展示已存在记录
+
+**Step 3：相似度检测（软规则，warning，不阻塞）**
+- 用 `pg_trgm` 算 `similarity(existing_name, new_name)`
+- `similarity > [threshold_reject]` → 硬警告（需要用户显式确认"不是同一家")
+- `similarity ∈ [threshold_warn, threshold_reject]` → 软警告（展示相似的几条，用户确认继续）
+
+**阈值配置**（写入 `audit_rule_configs` 表，默认值）:
+- `company_dedup.threshold_reject = 0.95`
+- `company_dedup.threshold_warn = 0.85`
+
+### 操作序列
+
+1. **调用工商信息 API**（外部依赖）
+   - 成功 → 填充工商字段
+   - 失败/超时（5 秒）→ 继续流程，工商字段留空，标记"需后续补齐"
+2. **跑重复检测**（见上）
+3. **生成自动简称**：`auto_aliases = generate_aliases(formal_name)`
+4. **Plan 预览阶段展示给用户**（关键步骤）:
+   ```
+   将要创建:
+   📋 新公司: 浙江塑界新材料有限公司
+      税号: 91330301XXXXXXXXXX
+      法人: 张XX
+      注册地: 浙江省温州市
+      业务类型: [请选择] 客户 / 供应商 / 既买又卖
+   
+   🏷️ 自动生成的简称:
+      • 塑界
+      • 浙江塑界
+      • 塑界新材料
+   
+   你还想追加其他简称吗？（如内部代号）
+   [确认创建] [编辑简称] [取消]
+   ```
+   - 用户可以：
+     - 直接确认
+     - 点"编辑简称"：删除不要的、追加要的
+     - 追加的简称 `source='manual'`；系统生成的保持 `source='auto_generated'`
+5. **事务内执行**:
+   - `INSERT INTO companies (...)` 1 条
+   - `INSERT INTO company_aliases (...)` N 条（auto + manual 混合）
+   - `INSERT INTO companies_history (...)` 1 条
+   - （简称表不做 history，简称本身是主数据的一部分）
+   - `INSERT INTO audit_logs (...)` 1 条关联上述全部
+
+### 异常分支
+
+**场景 A：工商 API 查不到这家公司**
+- 很常见（小企业、新注册企业可能还没入库）
+- 提示用户："系统查询工商信息失败，这家公司可能是新注册的或名称有出入。继续创建？"
+- 用户确认继续 → 只存 `formal_name`，其他工商字段留空
+
+**场景 B：工商 API 查到了，但返回的官方名称和用户输入不完全一致**
+- 例：用户输入"浙江塑界新材料"，API 返回官方名"浙江塑界新材料有限公司"
+- 提示用户："你填的是'浙江塑界新材料'，官方登记名是'浙江塑界新材料有限公司'，要用哪个？"
+- 一般建议用官方名
+
+**场景 C：税号已存在（Step 1 命中）**
+- 直接拒绝，引导用户："这家公司已在档案里，无需重复添加。编号：COMP-XXXX"
+
+**场景 D：名称完全相同**
+- 拒绝，展示已有记录
+
+**场景 E：相似度 > 0.95**
+- 硬警告，展示相似的几条：
+  ```
+  ⚠️ 发现高度相似的已有公司:
+  1. 浙江塑界新材料科技有限公司（相似度 0.96）
+  
+  是同一家吗？
+  [是，取消新建] [不是，继续创建] [我再看看，取消]
+  ```
+
+**场景 F：generate_aliases 生成了 0 个简称**
+- 可能全名太短或结构特殊
+- 提示用户："系统未能为这家公司生成简称，请手工至少添加 1 个，方便日常使用"
+
+**场景 G：工商 API 响应慢（> 5 秒）**
+- 超时降级：不阻塞用户
+- 后台任务稍后补齐工商字段
+
+### 审批要求
+
+**无需审批**。这是主数据新增，业务员自助完成。
+
+### 事后核验
+
+- `companies` 表有新记录
+- `company_aliases` 表有 N 条记录（N ≥ auto_aliases 数量 + 用户追加数量）
+- 所有简称的 `source` 和 `generator_version` 正确
+- `companies_history` 有 op_type='insert' 记录
+- `audit_logs` 记录了上述操作，`operations` 字段完整
+
+核验失败 → 事务回滚。
+
+### 自然语言回复模板
+
+**成功后**:
+```
+✅ 已添加客户：浙江塑界新材料有限公司
+
+📋 工商信息
+  • 税号：91330301XXXXXXXXXX
+  • 法人：张XX
+  • 注册地：浙江省温州市
+  • 业务关系：客户
+
+🏷️ 已创建 3 个简称
+  • 塑界
+  • 浙江塑界
+  • 塑界新材料
+
+下次提到这些简称，AI 会自动识别到这家公司。
+```
+
+**自动触发场景的衔接**:
+```
+客户已添加 ✅
+
+现在继续刚才的操作 —— 给浙江塑界新材料有限公司创建销售合同：
+请告诉我：品牌、型号、数量、单价、提货地。
+```
+
+---
+
+## 12. delete_alias（删除公司简称）
+
+### 用途
+
+业务员发现某个简称匹配总是出错（如"国贸"对应三家公司，AI 每次都要反问），主动删除某个简称。
+
+### 触发场景
+
+- "删掉'国贸'这个简称，太歧义了"
+- "'塑界'简称指向不对，删掉"
+
+### 输入参数
+
+| 参数 | 类型 | 说明 |
+|-----|------|------|
+| alias_id | uuid | 要删除的简称 ID（AI 先反查得到）|
+| reason | text | 删除原因（必填）|
+
+### 前置条件
+
+1. 业务员有 `delete_alias` 权限
+2. 简称存在且未软删除
+3. 简称要么是 `source=auto_generated/disambiguation`（系统生成的），要么 `created_by = 当前用户`（自己加的）
+   - **约束**：不能删除其他业务员手工加的简称（除非管理员）
+
+### 业务规则校验
+
+- 该公司删除后至少还保留 1 个简称（不允许把一家公司的所有简称都删光）
+- 若是最后一个简称：硬警告，提示"删除后这家公司无法通过简称查找，只能通过全名"
+
+### 操作序列
+
+1. 软删除 `company_aliases` 记录（填 `deleted_at / deleted_by / deleted_reason`）
+2. 写 `audit_logs`（简称表不做专门的 history，审计日志够用）
+
+### 异常分支
+
+**场景 A：是最后一个简称**
+- 硬警告不阻塞，用户显式确认即可
+
+**场景 B：简称不存在或已删除**
+- 直接拒绝
+
+### 审批要求
+
+无需审批。
+
+### 事后核验
+
+- `company_aliases` 对应记录 `deleted_at` 有值
+- 再次调用 `fuzzy_match_company` 查这个别名应该不命中
+
+### 自然语言回复模板
+
+```
+✅ 已删除简称"国贸"（原属公司：厦门国贸化工有限公司）
+
+原因：歧义，同一简称对应 3 家公司
+
+今后提到"国贸"，AI 会模糊搜索所有相关公司并让你选择。
+```
+
+---
+
+*v0.2 - 2026-04-21 新增 create_company + delete_alias；明确简称自动生成规则*
 *v0.1 - 2026-04-20 第一版，基础 10 个 workflow*
 *下一版本：补充流水导入 workflow + Phase 2 的拆分合同等复杂场景*
